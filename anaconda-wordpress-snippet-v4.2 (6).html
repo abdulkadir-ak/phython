@@ -1,0 +1,2644 @@
+<!-- ============================================================
+     REALISTIC 3D ANACONDA for WordPress  -  v4.2 installation code
+     1. Copy EVERYTHING below (including these comment lines).
+     2. Paste with ONE of these methods:
+        A) WPCode plugin:  Code Snippets > + Add Snippet >
+           "Add Your Custom Code" > Code Type: HTML Snippet >
+           paste > Insertion: "Site Wide Footer" > Save & Activate.
+        B) Gutenberg editor: add a "Custom HTML" block > paste > Update.
+        C) Elementor: drag an "HTML" widget onto the page > paste.
+     3. Open your page: the anaconda slithers over your content.
+     It never blocks clicks (transparent overlay, pointer-events:none).
+     Pauses itself in hidden tabs, honours reduced-motion, and recovers
+     from WebGL context loss. Config values are validated and clamped.
+     Optional settings - paste a line like this BEFORE this snippet:
+     <script>window.AnacondaConfig = { scale: 1, speed: 1, count: 1, shy: true, zIndex: 9998 };</script>
+     scale:  0.7 smaller ... 1 default (long adult build) ... 2 huge
+     speed:  0.5 slow ... 1 normal ... 1.5 fast
+     count:  1-3 snakes                             shy: false = ignore cursor
+     Remove it any time from the console:  window.anacondaWalk.destroy();
+     ============================================================ -->
+<script>
+/*!
+ * AnacondaSlide v4.2 — a small realistic 3D anaconda that slithers around
+ * your web page. Reacts to the cursor, clicks and scrolling. Pure client
+ * side: three.js (WebGL) on a transparent overlay. Never blocks clicks.
+ * Based on the green anaconda (Eunectes murinus): near-black olive body,
+ * large dark dorsal blotches, orange-yellow ocelli on the flanks, glossy
+ * wet-looking scales. Round pupils, jaw yawns, tail flicks, post-run
+ * panting, cursor curiosity.
+ * v2.0 engineering: full destroy()+resource disposal, WebGL failure and
+ * context-loss recovery, tab-hidden pause, adaptive pixel ratio, tiered
+ * texture quality, flat directional contact shadows, validated config.
+ * v2.1 anatomy: lofted continuous skull fused to the neck, anatomical
+ * girth profile (smooth spline, slim neck, front-third peak), posterior
+ * lateral compression + dorsal keel, hinged mandible halves, flush eyes.
+ * v3.0 body physics: head leads and the spine follows through gait-driven
+ * locomotion waves (rest / crawl / cruise / fast / escape / turn), rate-
+ * limited turn dynamics, distance-coupled S-weave, per-ring follow-through
+ * smoothing and a self-intersection guard.
+ * v4.0 skin & behaviour: raised 3D scale plates (per-scale tilt, boundary
+ * grooves, rims and tints in colour / normal / roughness maps), a fine
+ * scale normal map on the skull and jaw, and one continuous calm <-> alert
+ * arousal drive behind tongue-flick rate, head scanning, breathing and
+ * head sway.
+ * v4.1 self-overlap rendering: body loops that lie over each other squash
+ * toward the contact, mush out sideways and shade with a crease shadow
+ * (per-vertex AO, 3D contact incl. tail-over-body), loops in contact slim
+ * like squeezed flesh, and the skin rides a lightly smoothed copy of the
+ * physics chain so relax zigzag never scallops the coil rim. Movement and
+ * collision physics untouched.
+ * v4.2 seamless overlaps: every overlap field is now continuous in space
+ * and time. Contact pairs are sampled at stride 1 (the old even-ring
+ * stride left half the rings unmeasured, so the raw field alternated
+ * along the spine), contact strength and direction are temporally
+ * smoothed with fps-independent exponentials (no pop at the tangency
+ * threshold, no direction flips when the deepest partner changes) and
+ * then blurred along the spine, so the squash and the crease shadow can
+ * never step between neighbouring rings. The self-collision relax now
+ * visits every ring, its push field is blurred along the spine, and its
+ * ramp is limited per second instead of per frame. Movement and collision
+ * physics untouched.
+ * MIT.
+ */
+(function () {
+'use strict';
+
+var ROOT = typeof window !== 'undefined' ? window : globalThis;
+var TAU = Math.PI * 2;
+
+/* ---------------- configuration ---------------- */
+var DEFAULTS = {
+  scale: 0.92,         /* overall size multiplier                        */
+  speed: 1,            /* overall speed multiplier                       */
+  count: 1,            /* number of snakes (1-3)                         */
+  zIndex: 9998,        /* canvas z-index                                 */
+  shy: true,           /* slithers away when the cursor comes close      */
+  reactToClick: true,  /* click/tap on the page = big scare              */
+  reactToScroll: true, /* scrolling freezes it (alert), heavy scroll = dart */
+  headless: false      /* internal: simulation only                      */
+};
+
+/* green anaconda colours sampled from the reference photo */
+var PAL = {
+  backA: '#333a27',    /* dark olive back                       */
+  backB: '#1c2015',    /* near-black mottling                   */
+  blotch: '#10130c',   /* big dorsal blotches                   */
+  flankA: '#4a4f38',   /* olive-grey upper flank                */
+  flankB: '#565a3e',   /* warm lower flank                      */
+  bellyA: '#453f2a',   /* belly base                            */
+  bellyB: '#9a8c62',   /* belly cream mottle                    */
+  ocelli: '#d68a30',   /* orange eye-spots                      */
+  ocelli2: '#e8a840',  /* bright orange centre                  */
+  ring: '#0e110a',     /* dark ring around the ocelli           */
+  headBase: '#232816',
+  headOrange: '#d99a35',
+  jaw: '#bfb189'
+};
+
+/* ---------------- spine layout ----------------
+ * 80 points, one segment 0.10u -> body ~7.9u long.
+ * Girth profile t = 0 neck -> 1 tail tip, sampled from a real green
+ * anaconda: a clearly slimmer neck (~68% of max girth), deepest just
+ * in front of mid-body, a long full belly, then the tail taper.      */
+var N = 80;
+var SEG = 0.10;
+var RADIAL = 18;
+var PROFILE = [
+  [0.00, 0.238], [0.06, 0.262], [0.14, 0.300], [0.24, 0.340],
+  [0.32, 0.352], [0.44, 0.348], [0.58, 0.318], [0.70, 0.272],
+  [0.80, 0.212], [0.88, 0.150], [0.94, 0.095], [0.975, 0.058],
+  [1.00, 0.018]
+];
+/* monotone cubic interpolation (Fritsch-Carlson): the profile is
+ * C1-continuous, so there are no slope breaks between the knots - no
+ * visible "steps" in body width along the spine. */
+var PM = (function () {
+  var n = PROFILE.length, d = [], m = [], i;
+  for (i = 0; i < n - 1; i++) d.push((PROFILE[i + 1][1] - PROFILE[i][1]) / (PROFILE[i + 1][0] - PROFILE[i][0]));
+  m.push(d[0]);
+  for (i = 1; i < n - 1; i++) m.push(d[i - 1] * d[i] <= 0 ? 0 : (d[i - 1] + d[i]) / 2);
+  m.push(d[n - 2]);
+  for (i = 0; i < n - 1; i++) {
+    if (d[i] === 0) { m[i] = 0; m[i + 1] = 0; continue; }
+    var aa = m[i] / d[i], bb = m[i + 1] / d[i], ss = aa * aa + bb * bb;
+    if (ss > 9) {
+      var tk = 3 / Math.sqrt(ss);
+      m[i] = tk * aa * d[i]; m[i + 1] = tk * bb * d[i];
+    }
+  }
+  return m;
+})();
+function radiusAt(t) {
+  var i;
+  if (t <= 0) return PROFILE[0][1];
+  for (i = 1; i < PROFILE.length; i++) {
+    if (t <= PROFILE[i][0]) {
+      var a = PROFILE[i - 1], b = PROFILE[i];
+      var h = b[0] - a[0];
+      var u = (t - a[0]) / h;
+      var u2 = u * u, u3 = u2 * u;
+      return (2 * u3 - 3 * u2 + 1) * a[1] + (u3 - 2 * u2 + u) * h * PM[i - 1] +
+             (-2 * u3 + 3 * u2) * b[1] + (u3 - u2) * h * PM[i];
+    }
+  }
+  return PROFILE[PROFILE.length - 1][1];
+}
+var RAD = [];
+for (var _ri = 0; _ri < N; _ri++) RAD.push(radiusAt(_ri / (N - 1)));
+
+/* radius slope per unit arc length (static) - tilts the tube normals on the
+ * tapering parts so the analytic lighting follows the tail correctly */
+var RSLOPE = [];
+for (_ri = 0; _ri < N; _ri++) {
+  var _a = RAD[_ri > 0 ? _ri - 1 : 0], _b = RAD[_ri < N - 1 ? _ri + 1 : N - 1];
+  RSLOPE.push((_b - _a) / (2 * SEG));
+}
+
+/* ring direction tables (filled per quality tier by the manager) */
+var RADIAL = 18;
+var COSR = [], SINR = [];
+function setRadial(radial) {
+  RADIAL = radial;
+  COSR.length = 0; SINR.length = 0;
+  for (var j = 0; j <= RADIAL; j++) {
+    var th = j / RADIAL * TAU;
+    COSR.push(Math.cos(th));
+    SINR.push(Math.sin(th));
+  }
+}
+setRadial(RADIAL);
+
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function rnd(a, b) { return a + Math.random() * (b - a); }
+function angDiff(a, b) { var d = (a - b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; }
+
+/* ---------------- procedural anaconda skin ----------------
+ * One scale-plate pass draws into three canvases at once:
+ *   colour map (2048x512, u = along the body, v = around it),
+ *   normal map (from a height map, Sobel filtered),
+ *   roughness map (scale cells glossy, grooves dull).
+ * v4.0 skin: every cell is a RAISED PLATE, not a painted arc - a clipped
+ * dome whose peak is randomly offset (each scale tilted its own way), a
+ * dark boundary groove between plates, a bright rostral rim where a scale
+ * emerges from under its neighbour, and a per-scale tint in the colour
+ * and roughness maps. All detail lives in texture space, so it follows
+ * the deforming tube exactly and can never swim during movement. */
+function scaleRectPath(gc, cx, cy, w, h) {
+  var r2 = Math.min(w, h) * 0.42;
+  gc.beginPath();
+  gc.moveTo(cx - w * 0.5 + r2, cy - h * 0.5);
+  gc.arcTo(cx + w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5, r2);
+  gc.arcTo(cx + w * 0.5, cy + h * 0.5, cx - w * 0.5, cy + h * 0.5, r2);
+  gc.arcTo(cx - w * 0.5, cy + h * 0.5, cx - w * 0.5, cy - h * 0.5, r2);
+  gc.arcTo(cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy - h * 0.5, r2);
+  gc.closePath();
+}
+
+function paintScaleGrid(gCol, gHgt, gSpc, W, H, rows) {
+  var cell = H / rows;                       /* rows tie out at the v seam  */
+  var cols = Math.round(W / cell);
+  var r, c, sx, sy;
+  for (r = 0; r < rows; r++) {
+    sy = (r + 0.5) * cell;
+    for (c = 0; c < cols; c++) {
+      sx = (c + (r % 2 ? 0.5 : 0)) * cell;   /* staggered diagonal rows     */
+      /* per-scale identity: size jitter, dome-peak offset, plate height */
+      var pw = cell * rnd(0.94, 1.05);
+      var ph = cell * rnd(0.86, 1.00);
+      var hgt = rnd(0.55, 1.0);
+      var px = sx + rnd(-0.16, 0.16) * cell;
+      var py = sy + rnd(-0.16, 0.16) * cell;
+      /* height: raised dome clipped hard to the plate, so the boundary
+       * between neighbouring scales becomes a real groove in the normals */
+      if (gHgt) {
+        gHgt.save();
+        scaleRectPath(gHgt, sx, sy, pw, ph);
+        gHgt.clip();
+        var hg = gHgt.createRadialGradient(px, py, cell * 0.05, sx, sy, cell * 0.80);
+        hg.addColorStop(0, 'rgba(255,255,255,' + (0.36 * hgt).toFixed(3) + ')');
+        hg.addColorStop(0.72, 'rgba(255,255,255,' + (0.11 * hgt).toFixed(3) + ')');
+        hg.addColorStop(1, 'rgba(255,255,255,0)');
+        gHgt.fillStyle = hg;
+        gHgt.fillRect(sx - cell, sy - cell, cell * 3, cell * 3);
+        gHgt.restore();
+        /* dark boundary groove around each plate */
+        scaleRectPath(gHgt, sx, sy, pw, ph);
+        gHgt.strokeStyle = 'rgba(0,0,0,0.35)';
+        gHgt.lineWidth = Math.max(1, cell * 0.11);
+        gHgt.stroke();
+        /* bright rostral rim: the free edge catching the light */
+        gHgt.strokeStyle = 'rgba(255,255,255,' + (0.22 * hgt).toFixed(3) + ')';
+        gHgt.lineWidth = Math.max(1, cell * 0.07);
+        gHgt.beginPath();
+        gHgt.moveTo(sx - pw * 0.40, sy - ph * 0.34);
+        gHgt.lineTo(sx - pw * 0.40, sy + ph * 0.34);
+        gHgt.stroke();
+      }
+      /* colour: per-scale tint (some scales lighter, some darker) plus the
+       * fine dark boundary and a subtle highlight arc above the plate */
+      if (gCol) {
+        gCol.save();
+        scaleRectPath(gCol, sx, sy, pw, ph);
+        gCol.clip();
+        gCol.fillStyle = Math.random() < 0.5
+          ? 'rgba(214,222,184,' + rnd(0.015, 0.055).toFixed(3) + ')'
+          : 'rgba(8,10,5,' + rnd(0.02, 0.06).toFixed(3) + ')';
+        gCol.fillRect(sx - cell, sy - cell, cell * 3, cell * 3);
+        gCol.restore();
+        scaleRectPath(gCol, sx, sy, pw, ph);
+        gCol.strokeStyle = 'rgba(8,10,5,' + rnd(0.06, 0.16).toFixed(3) + ')';
+        gCol.lineWidth = Math.max(1, cell * 0.10);
+        gCol.stroke();
+        gCol.beginPath();
+        gCol.arc(sx, sy - cell * 0.16, cell * 0.42, Math.PI * 1.12, Math.PI * 1.88);
+        gCol.strokeStyle = 'rgba(210,220,180,' + rnd(0.02, 0.06).toFixed(3) + ')';
+        gCol.lineWidth = Math.max(1, cell * 0.08);
+        gCol.stroke();
+      }
+      /* roughness: per-scale gloss variation, plate cells bright (glossy) */
+      if (gSpc) {
+        gSpc.save();
+        scaleRectPath(gSpc, sx, sy, pw, ph);
+        gSpc.clip();
+        gSpc.fillStyle = 'rgba(255,255,255,' + rnd(0.10, 0.24).toFixed(3) + ')';
+        gSpc.fillRect(sx - cell, sy - cell, cell * 3, cell * 3);
+        gSpc.restore();
+      }
+    }
+  }
+  /* groove lines between rows (height + roughness) */
+  for (r = 0; r <= rows; r++) {
+    sy = r * cell;
+    if (gHgt) { gHgt.fillStyle = 'rgba(0,0,0,0.28)'; gHgt.fillRect(0, sy - cell * 0.10, W, cell * 0.20); }
+    if (gSpc) { gSpc.fillStyle = 'rgba(0,0,0,0.34)'; gSpc.fillRect(0, sy - cell * 0.07, W, cell * 0.14); }
+  }
+}
+
+function makeSkinMaps(T, mkCanvas, tier) {
+  /* quality tier: low = phones / weak hardware (quarter the pixels, fewer
+   * decorative passes - the look is preserved, generation cost drops ~4x) */
+  var W = tier && tier.low ? 1024 : 2048;
+  var H = tier && tier.low ? 256 : 512;
+  var px = W / 2048;                         /* area scale for pass counts */
+  var rows = tier && tier.low ? 52 : 72;
+  var cCol = mkCanvas(W, H), cHgt = mkCanvas(W, H), cSpc = mkCanvas(W, H);
+  var g = cCol.getContext ? cCol.getContext('2d') : null;
+  if (!g) {
+    return { map: new T.CanvasTexture(cCol), cHgt: cHgt, cSpc: cSpc };
+  }
+  var gH = cHgt.getContext('2d'), gS = cSpc.getContext('2d');
+  var i, x, y, r, rx, ry, rot;
+
+  gH.fillStyle = '#808080'; gH.fillRect(0, 0, W, H);
+  gS.fillStyle = '#5f5f5f'; gS.fillRect(0, 0, W, H);
+
+  /* base bands around the circumference (v: 0.5 = back, 0/1 = belly seam) */
+  var grd = g.createLinearGradient(0, 0, 0, H);
+  grd.addColorStop(0.00, PAL.bellyA); grd.addColorStop(0.07, PAL.bellyA);
+  grd.addColorStop(0.16, PAL.flankB); grd.addColorStop(0.26, PAL.flankA);
+  grd.addColorStop(0.36, PAL.backA);  grd.addColorStop(0.50, PAL.backA);
+  grd.addColorStop(0.64, PAL.backA);  grd.addColorStop(0.74, PAL.flankA);
+  grd.addColorStop(0.84, PAL.flankB); grd.addColorStop(0.93, PAL.bellyA);
+  grd.addColorStop(1.00, PAL.bellyA);
+  g.fillStyle = grd; g.fillRect(0, 0, W, H);
+
+  /* long body: dark mottling streaks along the back */
+  for (i = 0; i < 260 * px; i++) {
+    x = Math.random() * W; y = H * 0.5 + rnd(-0.17, 0.17) * H;
+    r = rnd(20, 90) * px;
+    var mg = g.createRadialGradient(x, y, 1, x, y, r);
+    mg.addColorStop(0, 'rgba(22,26,15,' + rnd(0.10, 0.30).toFixed(2) + ')');
+    mg.addColorStop(1, 'rgba(22,26,15,0)');
+    g.fillStyle = mg; g.beginPath();
+    g.ellipse(x, y, r, r * rnd(0.25, 0.55), 0, 0, TAU); g.fill();
+  }
+
+  /* big dorsal blotches: staggered chain down the spine */
+  for (i = 0; i < 26; i++) {
+    x = (i + 0.5) * (W / 26) + rnd(-30, 30) * px;
+    y = H * 0.5 + rnd(-26, 26) * px;
+    rx = rnd(65, 150) * px; ry = rnd(40, 70) * px;
+    var bg = g.createRadialGradient(x, y, ry * 0.2, x, y, rx);
+    bg.addColorStop(0, 'rgba(11,13,7,0.92)');
+    bg.addColorStop(0.7, 'rgba(13,16,9,0.6)');
+    bg.addColorStop(1, 'rgba(13,16,9,0)');
+    g.fillStyle = bg;
+    g.beginPath(); g.ellipse(x, y, rx, ry, rnd(-0.2, 0.2), 0, TAU); g.fill();
+    /* pale rim often present around anaconda blotches */
+    g.strokeStyle = 'rgba(130,134,96,0.20)'; g.lineWidth = rnd(2, 5) * px;
+    g.beginPath(); g.ellipse(x, y, rx * 0.92, ry * 0.9, 0, 0, TAU); g.stroke();
+  }
+
+  /* round dark spots on the upper flanks */
+  for (i = 0; i < 2; i++) {
+    var vy = i ? 0.665 : 0.335;
+    for (var s = 0; s < 46; s++) {
+      x = (s + 0.5) * (W / 46) + rnd(-18, 18) * px;
+      y = H * vy + rnd(-14, 14) * px;
+      r = rnd(9, 22) * px;
+      g.fillStyle = 'rgba(18,21,12,' + rnd(0.35, 0.6).toFixed(2) + ')';
+      g.beginPath(); g.ellipse(x, y, r, r * rnd(0.7, 1), 0, 0, TAU); g.fill();
+    }
+  }
+
+  /* orange-yellow ocelli rows on the upper flanks (anaconda signature) */
+  for (i = 0; i < 2; i++) {
+    var oy = i ? 0.705 : 0.295;
+    for (var o = 0; o < 46; o++) {
+      x = (o + (i ? 0.28 : 0.78)) * (W / 46) + rnd(-14, 14) * px;
+      y = H * oy + rnd(-14, 14) * px;
+      r = rnd(6, 12) * px;
+      g.strokeStyle = 'rgba(14,17,9,0.7)'; g.lineWidth = rnd(1.5, 3) * px;
+      g.fillStyle = 'rgba(214,138,48,' + rnd(0.7, 0.95).toFixed(2) + ')';
+      g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill(); g.stroke();
+      g.fillStyle = 'rgba(240,178,72,0.9)';
+      g.beginPath(); g.arc(x - r * 0.2, y - r * 0.2, r * 0.5, 0, TAU); g.fill();
+      /* occasional second fleck */
+      if (Math.random() < 0.4) {
+        g.fillStyle = 'rgba(217,154,53,0.6)';
+        g.beginPath(); g.arc(x + rnd(10, 24) * (Math.random() < 0.5 ? 1 : -1) * px, y + rnd(-8, 8) * px, r * 0.45, 0, TAU); g.fill();
+      }
+    }
+  }
+  /* smaller orange flecks toward the back edge and lower flank */
+  for (i = 0; i < 150 * px; i++) {
+    x = Math.random() * W;
+    var band = Math.random();
+    y = (band < 0.3 ? rnd(0.36, 0.44) : band < 0.6 ? rnd(0.56, 0.64) : band < 0.8 ? rnd(0.06, 0.14) : rnd(0.86, 0.94)) * H;
+    g.fillStyle = 'rgba(217,154,53,' + rnd(0.2, 0.55).toFixed(2) + ')';
+    g.beginPath(); g.arc(x, y, rnd(2, 5) * px, 0, TAU); g.fill();
+  }
+
+  /* belly mottle near the seam (mostly hidden against the ground) */
+  for (i = 0; i < 90 * px; i++) {
+    x = Math.random() * W;
+    y = (Math.random() < 0.5 ? rnd(0, 0.055) : rnd(0.945, 1)) * H;
+    g.fillStyle = 'rgba(154,140,98,' + rnd(0.2, 0.5).toFixed(2) + ')';
+    g.beginPath(); g.ellipse(x, y, rnd(6, 20) * px, rnd(4, 10) * px, 0, 0, TAU); g.fill();
+  }
+
+  /* fine speckle noise over everything */
+  for (i = 0; i < 4200 * px; i++) {
+    x = Math.random() * W; y = Math.random() * H;
+    g.fillStyle = Math.random() < 0.5
+      ? 'rgba(210,220,180,' + rnd(0.02, 0.07).toFixed(3) + ')'
+      : 'rgba(10,12,6,' + rnd(0.03, 0.10).toFixed(3) + ')';
+    g.fillRect(x, y, rnd(1.5, 4) * px, rnd(1.5, 4) * px);
+  }
+
+  /* subtle skin imperfections: a few scuffed / healed scales, dirt smudges
+   * low on the flanks - breaks the too-clean procedural look */
+  for (i = 0; i < 26 * px; i++) {
+    x = Math.random() * W;
+    y = (Math.random() < 0.7 ? rnd(0.24, 0.42) : rnd(0.58, 0.76)) * H;
+    r = rnd(4, 11) * px;
+    g.strokeStyle = 'rgba(96,92,66,' + rnd(0.10, 0.26).toFixed(2) + ')';
+    g.lineWidth = Math.max(1, r * 0.35);
+    g.beginPath(); g.arc(x, y, r, rnd(0, TAU), rnd(0, TAU) + rnd(1.2, 2.6)); g.stroke();
+    if (Math.random() < 0.5) {
+      g.fillStyle = 'rgba(120,110,74,' + rnd(0.05, 0.14).toFixed(2) + ')';
+      g.beginPath(); g.ellipse(x + r * 0.4, y + r * 0.2, r * 0.8, r * 0.45, rnd(-0.4, 0.4), 0, TAU); g.fill();
+    }
+  }
+
+  /* scale grid into all three canvases (rows tie out at the seam) */
+  paintScaleGrid(g, gH, gS, W, H, rows);
+
+  /* head-end shading so the tube blends into the lofted skull's occiput */
+  var hFade = g.createLinearGradient(0, 0, 260, 0);
+  hFade.addColorStop(0, 'rgba(20,22,14,0.34)'); hFade.addColorStop(1, 'rgba(20,22,14,0)');
+  g.fillStyle = hFade; g.fillRect(0, 0, 260, H);
+
+  var tex = new T.CanvasTexture(cCol);
+  tex.wrapS = T.ClampToEdgeWrapping; tex.wrapT = T.RepeatWrapping;
+  if (T.sRGBEncoding) { tex.encoding = T.sRGBEncoding; }
+  return { map: tex, cHgt: cHgt, cSpc: cSpc };
+}
+
+/* full skin set: colour + Sobel normal + roughness.
+ * MeshStandardMaterial has no specularMap, so the spec canvas is inverted
+ * into a roughnessMap instead: bright scale cells -> low roughness (glossy),
+ * dark grooves -> high roughness (matte). Gives the wet reptile sheen. */
+function makeSkinTextures(T, mkCanvas, tier) {
+  var s = makeSkinMaps(T, mkCanvas, tier);
+  var nTex = makeNormalTexture(T, s.cHgt);
+  var cR = mkCanvas(s.cSpc.width, s.cSpc.height);
+  var gR = cR.getContext ? cR.getContext('2d') : null;
+  if (gR) {
+    gR.globalCompositeOperation = 'difference';
+    gR.fillStyle = '#ffffff';
+    gR.drawImage(s.cSpc, 0, 0);
+    gR.globalCompositeOperation = 'source-over';
+  }
+  var rTex = new T.CanvasTexture(cR);
+  rTex.wrapS = T.ClampToEdgeWrapping; rTex.wrapT = T.RepeatWrapping;
+  return { map: s.map, normalMap: nTex, roughnessMap: rTex };
+}
+
+/* Sobel the height canvas into a tangent-space normal map.
+ * str (optional) scales the relief: 1.5 body default, lower for the
+ * subtler plating on the skull. */
+function makeNormalTexture(T, cHgt, str) {
+  var W = cHgt.width, H = cHgt.height;
+  var tex = new T.CanvasTexture(cHgt);
+  tex.wrapS = T.ClampToEdgeWrapping; tex.wrapT = T.RepeatWrapping;
+  var gH = typeof cHgt.getContext === 'function' ? cHgt.getContext('2d') : null;
+  if (!gH) return tex;
+  str = str || 1.5;
+  var src = gH.getImageData(0, 0, W, H).data;
+  var out = gH.createImageData(W, H);
+  var d = out.data;
+  var x, y;
+  for (y = 0; y < H; y++) {
+    for (x = 0; x < W; x++) {
+      var xp = (x + 1) % W, xm = (x - 1 + W) % W;
+      var yp = (y + 1) % H, ym = (y - 1 + H) % H;
+      var dx = src[(y * W + xp) * 4] - src[(y * W + xm) * 4];
+      var dy = src[(yp * W + x) * 4] - src[(ym * W + x) * 4];
+      var nx = -dx * str, ny = dy * str, nz = 255;
+      var L = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      var o = (y * W + x) * 4;
+      d[o] = (nx / L * 0.5 + 0.5) * 255;
+      d[o + 1] = (ny / L * 0.5 + 0.5) * 255;
+      d[o + 2] = (nz / L * 0.5 + 0.5) * 255;
+      d[o + 3] = 255;
+    }
+  }
+  gH.putImageData(out, 0, 0);
+  return tex;
+}
+
+/* fine raised scales for the head and jaw: small plates at low relief
+ * (the skull's scales are much smaller and flatter than the body's).
+ * Shares scaleRectPath with the body pass, so both surfaces wear the
+ * same plate pattern at different densities. */
+function makeHeadNormalTexture(T, mkCanvas) {
+  var S = 512;
+  var c = mkCanvas(S, S), tex = new T.CanvasTexture(c);
+  tex.wrapS = T.ClampToEdgeWrapping; tex.wrapT = T.RepeatWrapping;
+  var g = c.getContext ? c.getContext('2d') : null;
+  if (!g) return tex;
+  var rows = 64, cell = S / rows, cols = Math.round(S / cell);
+  var r, cc, sx, sy;
+  g.fillStyle = '#808080'; g.fillRect(0, 0, S, S);
+  for (r = 0; r < rows; r++) {
+    sy = (r + 0.5) * cell;
+    for (cc = 0; cc < cols; cc++) {
+      sx = (cc + (r % 2 ? 0.5 : 0)) * cell;
+      var hgt = rnd(0.40, 0.80);
+      g.save();
+      scaleRectPath(g, sx, sy, cell * rnd(0.94, 1.04), cell * rnd(0.86, 1.00));
+      g.clip();
+      var hg = g.createRadialGradient(
+        sx + rnd(-0.15, 0.15) * cell, sy + rnd(-0.15, 0.15) * cell, cell * 0.05,
+        sx, sy, cell * 0.75);
+      hg.addColorStop(0, 'rgba(255,255,255,' + (0.30 * hgt).toFixed(3) + ')');
+      hg.addColorStop(1, 'rgba(255,255,255,0)');
+      g.fillStyle = hg;
+      g.fillRect(sx - cell, sy - cell, cell * 3, cell * 3);
+      g.restore();
+      scaleRectPath(g, sx, sy, cell, cell * 0.96);
+      g.strokeStyle = 'rgba(0,0,0,0.30)';
+      g.lineWidth = Math.max(1, cell * 0.10);
+      g.stroke();
+    }
+  }
+  return makeNormalTexture(T, c, 1.1);
+}
+
+/* ---------------- eye iris texture ----------------
+ * bright orange boa iris: blazing equator band (the part that shows around
+ * the pupil), darker amber poles, fine dark flecks like the real thing */
+function makeEyeTexture(T, mkCanvas) {
+  var W = 256, H = 128;
+  var c = mkCanvas(W, H), tex = new T.CanvasTexture(c);
+  var g = c.getContext ? c.getContext('2d') : null;
+  if (!g) return tex;
+  var i;
+  var band = g.createLinearGradient(0, 0, 0, H);
+  band.addColorStop(0, '#6b3206');
+  band.addColorStop(0.26, '#e05e08');
+  band.addColorStop(0.44, '#ff8a1a');
+  band.addColorStop(0.56, '#ff9a20');
+  band.addColorStop(0.74, '#e05e08');
+  band.addColorStop(1, '#6b3206');
+  g.fillStyle = band; g.fillRect(0, 0, W, H);
+  /* dark iris flecks / radial streaks */
+  for (i = 0; i < 90; i++) {
+    var ex = Math.random() * W, ey = Math.random() * H;
+    g.strokeStyle = 'rgba(90,38,4,' + rnd(0.15, 0.4).toFixed(2) + ')';
+    g.lineWidth = rnd(1, 2.2);
+    g.beginPath(); g.moveTo(ex, ey); g.lineTo(ex + rnd(-3, 3), ey + rnd(4, 12)); g.stroke();
+  }
+  for (i = 0; i < 60; i++) {
+    g.fillStyle = 'rgba(255,190,90,' + rnd(0.1, 0.3).toFixed(2) + ')';
+    g.fillRect(Math.random() * W, Math.random() * H, rnd(1, 3), rnd(1, 2.5));
+  }
+  tex.wrapS = tex.wrapT = T.ClampToEdgeWrapping;
+  if (T.sRGBEncoding) tex.encoding = T.sRGBEncoding;
+  return tex;
+}
+
+/* ---------------- head texture ----------------
+ * Painted for the lofted skull mesh. UV layout mirrors the body tube:
+ * u = 0 at the snout tip -> 1 at the occiput (where it meets the neck),
+ * v = 0.5 the dorsal midline, v = 0/1 the gape seam along the jaw line. */
+function makeHeadTexture(T, mkCanvas) {
+  var S = 512;
+  var c = mkCanvas(S, S), tex = new T.CanvasTexture(c);
+  var g = c.getContext ? c.getContext('2d') : null;
+  if (!g) return tex;
+  var i, x, y, r;
+  g.fillStyle = PAL.headBase; g.fillRect(0, 0, S, S);
+
+  /* dark olive blotches along the dorsal band (v 0.40-0.60) */
+  for (i = 0; i < 46; i++) {
+    x = Math.random() * S;
+    y = S * (0.5 + rnd(-0.09, 0.09));
+    r = rnd(12, 40);
+    var bg = g.createRadialGradient(x, y, 1, x, y, r);
+    bg.addColorStop(0, 'rgba(16,19,11,' + rnd(0.22, 0.5).toFixed(2) + ')');
+    bg.addColorStop(1, 'rgba(16,19,11,0)');
+    g.fillStyle = bg; g.beginPath(); g.ellipse(x, y, r, r * 0.72, 0, 0, TAU); g.fill();
+  }
+
+  /* pale grey-olive snout shield on top of the rostrum (u 0.03-0.34),
+   * kept elongated, forward and MUTED - a bright pale crown reads as a
+   * second face / inverted jaw from above */
+  var pgrad = g.createRadialGradient(S * 0.17, S * 0.5, 2, S * 0.17, S * 0.5, S * 0.16);
+  pgrad.addColorStop(0, 'rgba(174,171,142,0.42)');
+  pgrad.addColorStop(0.55, 'rgba(162,159,130,0.26)');
+  pgrad.addColorStop(1, 'rgba(152,149,120,0)');
+  g.fillStyle = pgrad;
+  g.beginPath(); g.ellipse(S * 0.17, S * 0.5, S * 0.155, S * 0.058, 0, 0, TAU); g.fill();
+
+  /* shield sutures: dark midline seam + chevron cross-seams */
+  g.strokeStyle = 'rgba(24,22,14,0.72)'; g.lineWidth = 3.4;
+  g.beginPath();
+  for (i = 0; i <= 24; i++) {
+    var sx = S * (0.03 + i / 24 * 0.31);
+    var sy = S * 0.5 + Math.sin(i * 0.9) * 2.5;
+    if (i === 0) g.moveTo(sx, sy); else g.lineTo(sx, sy);
+  }
+  g.stroke();
+  g.lineWidth = 2.2; g.strokeStyle = 'rgba(24,22,14,0.5)';
+  for (i = 0; i < 4; i++) {
+    var cx2 = S * (0.055 + i * 0.075);
+    g.beginPath();
+    g.moveTo(cx2, S * 0.5 - S * 0.062);
+    g.quadraticCurveTo(cx2 + S * 0.020, S * 0.5, cx2, S * 0.5 + S * 0.062);
+    g.stroke();
+  }
+  /* mottling inside the shield */
+  for (i = 0; i < 22; i++) {
+    var mr = rnd(3, 8);
+    g.fillStyle = 'rgba(58,58,40,' + rnd(0.14, 0.28).toFixed(2) + ')';
+    g.beginPath();
+    g.ellipse(S * rnd(0.05, 0.31), S * rnd(0.44, 0.56), mr, mr * rnd(0.5, 0.8), 0, 0, TAU);
+    g.fill();
+  }
+
+  /* small pale parietal patch at the back of the crown (u 0.60-0.82) */
+  var pq = g.createRadialGradient(S * 0.71, S * 0.5, 2, S * 0.71, S * 0.5, S * 0.10);
+  pq.addColorStop(0, 'rgba(174,171,142,0.18)');
+  pq.addColorStop(1, 'rgba(152,149,120,0)');
+  g.fillStyle = pq;
+  g.beginPath(); g.ellipse(S * 0.71, S * 0.5, S * 0.10, S * 0.045, 0, 0, TAU); g.fill();
+  g.strokeStyle = 'rgba(24,22,14,0.4)'; g.lineWidth = 2.4;
+  g.beginPath();
+  for (i = 0; i <= 14; i++) {
+    var bx = S * (0.62 + i / 14 * 0.18);
+    var by = S * 0.5 + Math.sin(i * 1.1) * 2;
+    if (i === 0) g.moveTo(bx, by); else g.lineTo(bx, by);
+  }
+  g.stroke();
+
+  /* very subdued orange occipital hint where the head meets the neck -
+   * soft and feathered: a hard-edged slab reads as a growth on the crown */
+  var band = g.createRadialGradient(S * 0.86, S * 0.5, 2, S * 0.86, S * 0.5, S * 0.11);
+  band.addColorStop(0, 'rgba(217,154,53,0.14)');
+  band.addColorStop(0.6, 'rgba(232,168,64,0.10)');
+  band.addColorStop(1, 'rgba(217,154,53,0)');
+  g.fillStyle = band;
+  g.beginPath(); g.ellipse(S * 0.86, S * 0.5, S * 0.085, S * 0.13, 0, 0, TAU); g.fill();
+
+  /* faint painted postocular stripe behind each eye (also built in geometry) */
+  for (i = 0; i < 2; i++) {
+    var py = i ? S * 0.66 : S * 0.34;
+    var pst = g.createRadialGradient(S * 0.52, py, 1, S * 0.52, py, S * 0.11);
+    pst.addColorStop(0, 'rgba(12,14,9,0.5)');
+    pst.addColorStop(1, 'rgba(12,14,9,0)');
+    g.fillStyle = pst;
+    g.beginPath(); g.ellipse(S * 0.52, py, S * 0.075, S * 0.11, 0, 0, TAU); g.fill();
+  }
+
+  /* dark bridle line from each eye up-forward to the nostril - a strong
+   * top/bottom cue that keeps the face reading right-side-up head-on */
+  for (i = 0; i < 2; i++) {
+    var y0 = i ? S * 0.66 : S * 0.34;
+    var y1 = i ? S * 0.565 : S * 0.435;
+    var brd = g.createLinearGradient(S * 0.48, y0, S * 0.14, y1);
+    brd.addColorStop(0, 'rgba(16,18,10,0.45)');
+    brd.addColorStop(1, 'rgba(16,18,10,0.25)');
+    g.strokeStyle = brd; g.lineWidth = 3.0; g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(S * 0.48, y0);
+    g.quadraticCurveTo(S * 0.28, (y0 + y1) * 0.5 - S * 0.028, S * 0.14, y1);
+    g.stroke();
+  }
+  g.lineCap = 'butt';
+
+  /* pale cream upper lip brightening toward the gape seam, both sides */
+  for (i = 0; i < 2; i++) {
+    var lg = i
+      ? g.createLinearGradient(0, S * 0.72, 0, S)
+      : g.createLinearGradient(0, S * 0.28, 0, 0);
+    lg.addColorStop(0, 'rgba(226,216,180,0)');
+    lg.addColorStop(0.55, 'rgba(226,216,180,0.30)');
+    lg.addColorStop(1, 'rgba(236,228,196,0.55)');
+    g.fillStyle = lg;
+    g.fillRect(0, i ? S * 0.72 : 0, S, S * 0.28);
+  }
+
+  /* big blocky labial scales along both jaw lines, brightest at the snout */
+  var NB = 30, bw = S / NB;
+  for (i = 0; i < NB; i++) {
+    var bcx = (i + 0.5) / NB * S;
+    var d = Math.abs(bcx - 0.10 * S);
+    var glow = Math.exp(-(d * d) / (2 * (S * 0.16) * (S * 0.16)));
+    var a = 0.16 + 0.5 * glow;
+    for (var row = 0; row < 2; row++) {
+      var ry = row ? S * 0.855 : S * 0.145;
+      g.fillStyle = 'rgba(238,230,198,' + a.toFixed(2) + ')';
+      g.beginPath();
+      if (g.roundRect) {
+        g.roundRect(bcx - bw * 0.40, ry + Math.sin(i * 2.3) * 2, bw * 0.80, S * 0.105, 4);
+      } else {
+        g.rect(bcx - bw * 0.40, ry + Math.sin(i * 2.3) * 2, bw * 0.80, S * 0.105);
+      }
+      g.fill();
+      g.strokeStyle = 'rgba(22,20,12,0.5)'; g.lineWidth = 2; g.stroke();
+    }
+  }
+  /* seam between the two labial rows on each side */
+  g.strokeStyle = 'rgba(22,20,12,0.32)'; g.lineWidth = 1.6;
+  g.beginPath(); g.moveTo(0, S * 0.078); g.lineTo(S, S * 0.078); g.stroke();
+  g.beginPath(); g.moveTo(0, S * 0.922); g.lineTo(S, S * 0.922); g.stroke();
+
+  /* dark mouth seam along the gape line (v 0.055 / 0.945) */
+  g.strokeStyle = 'rgba(9,11,7,0.6)'; g.lineWidth = 3;
+  for (i = 0; i < 2; i++) {
+    var my0 = i ? S * 0.945 : S * 0.055;
+    g.beginPath();
+    for (var k2 = 0; k2 <= S; k2 += 8) {
+      var myy = my0 + Math.sin(k2 * 0.11) * 2.2;
+      if (k2 === 0) g.moveTo(k2, myy); else g.lineTo(k2, myy);
+    }
+    g.stroke();
+  }
+
+  /* pink rostral flush + heat-pit dots at the snout tip (u < 0.05) */
+  var rosy = g.createRadialGradient(S * 0.025, S * 0.5, 2, S * 0.025, S * 0.5, S * 0.09);
+  rosy.addColorStop(0, 'rgba(206,116,94,0.40)');
+  rosy.addColorStop(1, 'rgba(206,116,94,0)');
+  g.fillStyle = rosy;
+  g.beginPath(); g.ellipse(S * 0.025, S * 0.5, S * 0.055, S * 0.09, 0, 0, TAU); g.fill();
+  g.fillStyle = 'rgba(186,62,44,0.55)';
+  for (i = -2; i <= 2; i++) {
+    g.beginPath();
+    g.arc(S * 0.028, S * 0.5 + i * S * 0.017, 1.9, 0, TAU); g.fill();
+  }
+
+  /* occiput blend: the rear of the loft dives under the body texture */
+  var hFade = g.createLinearGradient(S * 0.86, 0, S, 0);
+  hFade.addColorStop(0, 'rgba(20,22,14,0)');
+  hFade.addColorStop(1, 'rgba(20,22,14,0.4)');
+  g.fillStyle = hFade; g.fillRect(S * 0.86, 0, S * 0.14, S);
+
+  /* fine reticulation + light speckles */
+  for (i = 0; i < 240; i++) {
+    x = Math.random() * S; y = Math.random() * S;
+    g.strokeStyle = 'rgba(12,14,8,' + rnd(0.08, 0.2).toFixed(3) + ')';
+    g.lineWidth = rnd(1, 2.4);
+    g.beginPath();
+    g.arc(x, y, rnd(4, 12), Math.random() * TAU, Math.random() * TAU + 1.6);
+    g.stroke();
+  }
+  for (i = 0; i < 480; i++) {
+    g.fillStyle = 'rgba(220,226,190,' + rnd(0.02, 0.08).toFixed(3) + ')';
+    g.fillRect(Math.random() * S, Math.random() * S, rnd(1.5, 3.5), rnd(1.5, 3.5));
+  }
+  tex.wrapS = tex.wrapT = T.ClampToEdgeWrapping;
+  if (T.sRGBEncoding) tex.encoding = T.sRGBEncoding;
+  return tex;
+}
+
+/* simple procedural sky/ground environment for the wet gloss */
+function makeEnvMap(T, mkCanvas) {
+  var faces = [], i, c, g, k;
+  for (i = 0; i < 6; i++) {
+    c = mkCanvas(64, 64);
+    g = c.getContext ? c.getContext('2d') : null;
+    if (g) {
+      if (i === 2) {            /* up: pale sky */
+        g.fillStyle = '#d6dfdf'; g.fillRect(0, 0, 64, 64);
+      } else if (i === 3) {     /* down: dark ground */
+        g.fillStyle = '#17170f'; g.fillRect(0, 0, 64, 64);
+      } else {                  /* sides: sky-to-ground gradient */
+        var gr = g.createLinearGradient(0, 0, 0, 64);
+        gr.addColorStop(0, '#c4cfcd'); gr.addColorStop(0.55, '#8f998a');
+        gr.addColorStop(0.62, '#4a4c36'); gr.addColorStop(1, '#2c2d1e');
+        g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+        /* faint horizon glow so the sheen reads wet, not grey */
+        for (k = 0; k < 5; k++) {
+          g.fillStyle = 'rgba(255,250,230,0.05)';
+          g.fillRect(0, 30 + k * 2, 64, 2);
+        }
+      }
+    }
+    faces.push(c);
+  }
+  var tex = new T.CubeTexture(faces);
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/* pale speckled throat / lower jaw */
+function makeJawTexture(T, mkCanvas) {
+  var S = 256;
+  var c = mkCanvas(S, S), tex = new T.CanvasTexture(c);
+  var g = c.getContext ? c.getContext('2d') : null;
+  if (!g) return tex;
+  var i;
+  g.fillStyle = PAL.jaw; g.fillRect(0, 0, S, S);
+  /* soft pink flush on the chin tip (front-bottom of the jaw sphere) */
+  var chin = g.createRadialGradient(S * 0.25, S * 0.36, 2, S * 0.25, S * 0.36, S * 0.16);
+  chin.addColorStop(0, 'rgba(198,108,88,0.30)');
+  chin.addColorStop(1, 'rgba(198,108,88,0)');
+  g.fillStyle = chin;
+  g.beginPath(); g.ellipse(S * 0.25, S * 0.36, S * 0.16, S * 0.12, 0, 0, TAU); g.fill();
+  for (i = 0; i < 220; i++) {
+    g.fillStyle = 'rgba(24,22,12,' + rnd(0.15, 0.5).toFixed(2) + ')';
+    g.beginPath();
+    g.ellipse(Math.random() * S, Math.random() * S, rnd(2, 8), rnd(1.5, 5), 0, 0, TAU);
+    g.fill();
+  }
+  for (i = 0; i < 160; i++) {
+    g.fillStyle = 'rgba(230,222,190,' + rnd(0.05, 0.18).toFixed(2) + ')';
+    g.fillRect(Math.random() * S, Math.random() * S, rnd(2, 5), rnd(2, 5));
+  }
+  if (T.sRGBEncoding) tex.encoding = T.sRGBEncoding;
+  return tex;
+}
+
+function makeShadowTexture(T, mkCanvas) {
+  var c = mkCanvas(128, 128), tex = new T.CanvasTexture(c);
+  var g = c.getContext ? c.getContext('2d') : null;
+  if (g) {
+    var rg = g.createRadialGradient(64, 64, 4, 64, 64, 62);
+    rg.addColorStop(0, 'rgba(0,0,0,0.55)');
+    rg.addColorStop(0.65, 'rgba(0,0,0,0.22)');
+    rg.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = rg; g.fillRect(0, 0, 128, 128);
+  }
+  return tex;
+}
+
+/* ---------------- rig: tube geometry ----------------
+ * One skinned tube rebuilt every frame from the spine chain.
+ * Rings follow the spine points; radial vertices face outward.
+ * v UV: 0.5 = back centre, 0/1 seam hidden against the ground.     */
+function buildTubeGeometry(T) {
+  var per = RADIAL + 1;
+  var count = N * per;
+  var pos = new Float32Array(count * 3);
+  var nor = new Float32Array(count * 3);
+  /* v4.1: per-vertex contact shading (fake ambient occlusion where the body
+   * lies over itself); filled every frame in _updateBody */
+  var col = new Float32Array(count * 3);
+  var uv = new Float32Array(count * 2);
+  var idx = new (count > 65535 ? Uint32Array : Uint16Array)((N - 1) * RADIAL * 6);
+  var i, j, o, a, b, k = 0;
+  for (i = 0; i < N; i++) {
+    for (j = 0; j <= RADIAL; j++) {
+      o = (i * per + j) * 2;
+      uv[o] = i / (N - 1);
+      uv[o + 1] = (j / RADIAL + 0.5) % 1;
+    }
+    o = (i * per) * 3;
+    nor[o + 1] = 1;             /* placeholder, filled analytically per frame */
+    for (j = 1; j <= RADIAL; j++) nor[o + j * 3 + 1] = 1;
+  }
+  for (i = 0; i < N - 1; i++) {
+    for (j = 0; j < RADIAL; j++) {
+      a = i * per + j;
+      b = a + per;
+      idx[k++] = a; idx[k++] = a + 1; idx[k++] = b;
+      idx[k++] = a + 1; idx[k++] = b + 1; idx[k++] = b;
+    }
+  }
+  var g = new T.BufferGeometry();
+  g.setAttribute('position', new T.BufferAttribute(pos, 3).setUsage(T.DynamicDrawUsage));
+  g.setAttribute('normal', new T.BufferAttribute(nor, 3).setUsage(T.DynamicDrawUsage));
+  g.setAttribute('color', new T.BufferAttribute(col, 3).setUsage(T.DynamicDrawUsage));
+  g.setAttribute('uv', new T.BufferAttribute(uv, 2));
+  g.setIndex(new T.BufferAttribute(idx, 1));
+  return g;
+}
+
+/* ---------------- lofted skull ----------------
+ * The head is ONE continuous surface, built like the body tube: a stack of
+ * cross-sections from the snout tip to the occiput. Width rises from the
+ * blunt rostrum to the jaw corners and eases back into the neck; the rear
+ * stations reuse the body-ring formulas (same belly flatten and centre
+ * offset) so the head melts into the first neck rings with no seam. */
+var HEAD_ST = [
+  /* [z, halfWidth, vFlat, lift]  z: -0.24 (in the neck) -> 0.62 snout tip.
+   * vFlat slimms the section vertically (the skull is flatter than the
+   * neck ring it joins); lift raises the chin off the ground forward. */
+  [-0.24, 0.252, 0.890, 0.000],
+  [-0.16, 0.255, 0.870, 0.001],
+  [-0.08, 0.262, 0.830, 0.003],
+  [ 0.00, 0.268, 0.810, 0.006],
+  [ 0.06, 0.271, 0.800, 0.008],
+  [ 0.12, 0.272, 0.790, 0.010],
+  [ 0.18, 0.262, 0.790, 0.012],
+  [ 0.24, 0.244, 0.790, 0.015],
+  [ 0.29, 0.226, 0.795, 0.018],
+  [ 0.34, 0.208, 0.805, 0.020],
+  [ 0.39, 0.186, 0.812, 0.023],
+  [ 0.44, 0.164, 0.820, 0.026],
+  [ 0.48, 0.140, 0.820, 0.028],
+  [ 0.52, 0.118, 0.820, 0.030],
+  [ 0.58, 0.078, 0.830, 0.032],
+  [ 0.62, 0.040, 0.840, 0.033]
+];
+function buildHeadGeometry(T) {
+  var RH = 20, ST = HEAD_ST.length, per = RH + 1;
+  var pos = new Float32Array(ST * per * 3);
+  var nor = new Float32Array(ST * per * 3);
+  var uv = new Float32Array(ST * per * 2);
+  var idx = new Uint16Array((ST - 1) * RH * 6);
+  var HV = 0.94;
+  var i, j, o, a, b, k = 0;
+  for (i = 0; i < ST; i++) {
+    var z = HEAD_ST[i][0], r = HEAD_ST[i][1], vF = HEAD_ST[i][2], lift = HEAD_ST[i][3];
+    var cy = r * 0.677 + lift;          /* same ring-centre offset as the body */
+    var ia = i > 0 ? i - 1 : 0, ib = i < ST - 1 ? i + 1 : ST - 1;
+    var rs = (HEAD_ST[ib][1] - HEAD_ST[ia][1]) / ((HEAD_ST[ib][0] - HEAD_ST[ia][0]) || 1);
+    for (j = 0; j <= RH; j++) {
+      o = (i * per + j) * 2;
+      uv[o] = 1 - i / (ST - 1);         /* u 0 = snout tip, u 1 = occiput   */
+      uv[o + 1] = (j / RH + 0.5) % 1;   /* v 0.5 dorsal midline, 0/1 gape   */
+      var th = j / RH * TAU;
+      var up = Math.cos(th), sn = Math.sin(th);
+      var vf, vf2;
+      if (up < 0) {
+        /* belly: body flatten, eased back to the exact body shape below */
+        vf = (HV - (1 - HV) * (-up) * 2.2) * (1 + (vF - 1) * (1 + up));
+        vf2 = 1 + (1 - vf) * 0.55;
+      } else {
+        vf = HV * vF;
+        vf2 = 1;
+      }
+      var cs = up * r * 0.80 * vf;
+      var sn2 = sn * r * vf2;
+      o = (i * per + j) * 3;
+      pos[o] = sn2;
+      pos[o + 1] = cy + cs;
+      pos[o + 2] = z;
+      /* analytic normal: radial direction tilted against the width slope */
+      var nX = sn2, nY = cs, nZ = -rs * 0.9;
+      var nL = 1 / (Math.sqrt(nX * nX + nY * nY + nZ * nZ) || 1);
+      nor[o] = nX * nL; nor[o + 1] = nY * nL; nor[o + 2] = nZ * nL;
+    }
+  }
+  for (i = 0; i < ST - 1; i++) {
+    for (j = 0; j < RH; j++) {
+      a = i * per + j;
+      b = a + per;
+      idx[k++] = a; idx[k++] = a + 1; idx[k++] = b;
+      idx[k++] = a + 1; idx[k++] = b + 1; idx[k++] = b;
+    }
+  }
+  var g = new T.BufferGeometry();
+  g.setAttribute('position', new T.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new T.BufferAttribute(nor, 3));
+  g.setAttribute('uv', new T.BufferAttribute(uv, 2));
+  g.setIndex(new T.BufferAttribute(idx, 1));
+  return g;
+}
+
+/* ---------------- one anaconda ---------------- */
+function AnacondaRig(mgr, spawn) {
+  var T = mgr._T, i;
+  this._mgr = mgr;
+  this._T = T;
+
+  /* spine state: body trails behind the spawn heading */
+  this._P = [];
+  var acc = 0, fx = Math.sin(spawn.h), fz = Math.cos(spawn.h);
+  for (i = 0; i < N; i++) {
+    if (i > 0) acc += SEG;
+    this._P.push({ x: spawn.x - fx * acc, z: spawn.z - fz * acc });
+  }
+  this._R = []; this._dirs = []; this._tang = []; this._right = []; this._upv = [];
+  for (i = 0; i < N; i++) {
+    this._R.push(new T.Vector3(0, 0.02, 0));
+    this._dirs.push({ x: fx, z: fz });
+    this._tang.push(new T.Vector3(fx, 0, fz));
+    this._right.push(new T.Vector3(-fz, 0, fx));
+    this._upv.push(new T.Vector3(0, 1, 0));
+  }
+
+  this._heading = spawn.h; this._headingT = spawn.h;
+  this._speed = 0; this._vTarget = 0;
+  this._phase = rnd(0, TAU);
+  this._weavePh = rnd(0, TAU);      /* spatial phase of the serpentine weave */
+  this._roll = 0; this._prevHeading = spawn.h;
+  this._state = 'idle'; this._stateT = 0;
+  this._idleDur = 1.0 + spawn.stagger;
+  this._cruiseJit = 0;
+  this._target = { x: spawn.x, z: spawn.z + 2 };
+  this._idleYaw = 0; this._idleYawT = 0; this._nextLook = 0.4;
+  this._tongueT = 0; this._tongueNext = rnd(0.7, 2.2); this._tongueDur = 1.1;
+  this._tongueSeed = Math.random() * 10; this._tongueRe = 0; this._jawOpen = 0;
+  this._scareCd = 0;
+  this._alert = 0;
+  this._alertPoint = { x: spawn.x, z: spawn.z };
+  this._afterFreeze = 'auto';
+  this._agitate = 0;               /* fast tail-flick energy after a scare */
+  this._pant = 0;                  /* heavy breathing after a speed burst  */
+  this._curious = 0;               /* watching a slow cursor from afar     */
+  this._arousal = 0.2;             /* v4.0 continuous calm <-> alert drive */
+  this._yawnT = 0; this._yawnOpen = 0;
+  this._yawnDur = 1.8; this._yawnNext = rnd(16, 34);
+
+  /* v3.0 movement physics state */
+  this._turnVel = 0;               /* smoothed angular velocity (rad/s)      */
+  this._gait = 'rest';             /* rest/crawl/cruise/fast/escape/turn     */
+  this._seed = Math.random() * 100;/* per-animal drift for organic variation */
+  this._waveD = 0;                 /* locomotion wave phase, distance-coupled*/
+  this._idleAmt = 1;               /* smooth 0..1 rest-vs-locomotion blend   */
+  this._weaveAmp = 0.46;           /* S-weave amplitude (gait + drift driven)*/
+  this._waveSm = new Float32Array(N); /* per-ring smoothed lateral offset    */
+  this._rlxX = new Float32Array(N);   /* self-collision relax accumulators   */
+  this._rlxZ = new Float32Array(N);
+  this._roX = new Float32Array(N);    /* applied relax offset per ring (low- */
+  this._roZ = new Float32Array(N);    /* passed: pushes ramp, never jerk)    */
+  this._roTX = new Float32Array(N);   /* v4.2: spine-blurred relax push      */
+  this._roTZ = new Float32Array(N);   /* targets (no ring-to-ring zigzag)    */
+  /* v4.1: strongest body contact per ring, for flesh squash + crease
+   * shading where the body lies over itself (see _relaxBody/_updateBody) */
+  this._ctA = new Float32Array(N);    /* contact strength 0..1               */
+  this._ctNX = new Float32Array(N);   /* unit direction toward the contact   */
+  this._ctNY = new Float32Array(N);
+  this._ctNZ = new Float32Array(N);
+  /* v4.1: visual ring centers - a lightly smoothed copy of the physics
+   * chain. Pairwise relaxation settles into a small period-2 in/out ring
+   * pattern inside a tight coil; smoothing removes that zigzag from the
+   * SKIN only - movement and collision physics stay untouched. */
+  this._Rv = new Float32Array(N * 3);
+  /* v4.2: continuous overlap fields. Raw per-frame contact data pops at
+   * the tangency threshold and flips when the deepest partner changes,
+   * which reads as a flickering crease; _ctASm/_ctN*s hold a temporally
+   * smoothed copy (exponential in SECONDS, identical at any fps) and
+   * _ctA2/_ctN*2 a spine-blurred copy that the cross-section consumes -
+   * the 3-tap blur makes it impossible for the squash or the crease
+   * shadow to step between neighbouring rings. */
+  this._ctASm = new Float32Array(N);
+  this._ctNXs = new Float32Array(N);
+  this._ctNYs = new Float32Array(N);
+  this._ctNZs = new Float32Array(N);
+  this._ctA2 = new Float32Array(N);
+  this._ctNX2 = new Float32Array(N);
+  this._ctNY2 = new Float32Array(N);
+  this._ctNZ2 = new Float32Array(N);
+  this._ctW = new Float32Array(N);
+  this._avoidSlow = 0;             /* cramped-space speed damping 0..1       */
+  this._gp = {                     /* blended gait parameters                */
+    waveK: GAITS.rest.waveK, waveA: GAITS.rest.waveA, neck: GAITS.rest.neck,
+    tailG: GAITS.rest.tailG, stride: GAITS.rest.stride, weave: GAITS.rest.weave,
+    push: GAITS.rest.push, accel: GAITS.rest.accel
+  };
+
+  this._vA = new T.Vector3(); this._vB = new T.Vector3();
+
+  /* body tube (geometry registered with the manager for dispose()) */
+  this._geo = mgr._geo(buildTubeGeometry(T));
+  this._tube = new T.Mesh(this._geo, mgr._matSkin);
+  this._tube.frustumCulled = false;
+  mgr._root.add(this._tube);
+
+  /* tail tip */
+  this._tip = new T.Mesh(mgr._tipGeo, mgr._matSkin);
+  mgr._root.add(this._tip);
+
+  this._buildHead(mgr);
+  this._buildShadows(mgr);
+}
+
+AnacondaRig.prototype._buildHead = function (mgr) {
+  var T = this._T, m, side;
+  var g = new T.Group();
+
+  /* skull: one lofted surface from snout tip to occiput; the rear stations
+   * match the neck ring cross-section, so there is no visible junction */
+  m = new T.Mesh(mgr._geo(buildHeadGeometry(T)), mgr._matHead);
+  g.add(m);
+  this._skullMesh = m;
+
+  /* cheek / quadrate bulges at the jaw corners - the widest point of the
+   * real skull, just ahead of the neck (kept subtle: deep-set, low) */
+  for (side = -1; side <= 1; side += 2) {
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.052, 12, 9)), mgr._matHeadDark);
+    m.scale.set(0.52, 0.70, 1.25);
+    m.position.set(side * 0.228, 0.115, 0.04);
+    g.add(m);
+  }
+
+  /* canthus rostralis: the raised ridge along each top edge of the snout */
+  for (side = -1; side <= 1; side += 2) {
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.024, 10, 8)), mgr._matHeadDark);
+    m.scale.set(0.50, 0.50, 3.2);
+    m.position.set(side * 0.075, 0.195, 0.40);
+    g.add(m);
+  }
+
+  /* rostral scale: the blunt cap on the very tip of the snout */
+  m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.048, 12, 9)), mgr._matHeadDark);
+  m.scale.set(1.05, 0.62, 0.75);
+  m.position.set(0, 0.075, 0.565);
+  g.add(m);
+
+  /* hinged lower jaw: two slim mandible halves on a quadrate pivot behind
+   * the jaw corners, with the flexible chin gap real snakes show */
+  var jp = new T.Group();
+  jp.position.set(0, 0.058, -0.055);
+  for (side = -1; side <= 1; side += 2) {
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.095, 12, 9)), mgr._matJaw);
+    m.scale.set(0.58, 0.40, 2.75);
+    m.position.set(side * 0.072, -0.028, 0.20);
+    m.rotation.y = side * 0.10;
+    jp.add(m);
+    if (side < 0) this._mandibleL = m; else this._mandibleR = m;
+  }
+  /* chin knob where the halves meet */
+  m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.026, 8, 6)), mgr._matJaw);
+  m.position.set(0, -0.045, 0.435);
+  jp.add(m);
+  /* dark mouth interior: shows through the gape when the jaw drops */
+  m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.088, 10, 8)), mgr._matPupil);
+  m.scale.set(1.05, 0.60, 1.65);
+  m.position.set(0, 0.012, 0.16);
+  jp.add(m);
+  g.add(jp);
+  this._jawPivot = jp;
+
+  /* dark eye sockets just behind / below each eye - kept small and buried
+   * in the crown flank (a proud glossy sphere reads as a blob from above) */
+  for (side = -1; side <= 1; side += 2) {
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.030, 10, 8)), mgr._matHeadDark);
+    m.scale.set(0.85, 0.42, 1.0);
+    m.position.set(side * 0.196, 0.198, 0.185);
+    g.add(m);
+  }
+
+  /* big blazing orange eyes set HIGH and dorso-lateral on the skull rim,
+   * flush in their sockets like the reference face */
+  for (side = -1; side <= 1; side += 2) {
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.048, 14, 12)), mgr._matEye);
+    m.scale.set(0.92, 0.88, 1.0);
+    m.position.set(side * 0.176, 0.252, 0.24);
+    g.add(m);
+    /* green anacondas have ROUND pupils (vertical slits are python/viper) */
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.026, 10, 8)), mgr._matPupil);
+    m.position.set(side * 0.212, 0.254, 0.262);
+    m.scale.set(0.85, 1.0, 0.9);
+    g.add(m);
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.0035, 6, 6)), mgr._matGlint);
+    m.position.set(side * 0.218, 0.266, 0.268);
+    g.add(m);
+    /* supraocular ridge: the bony scale shelf over the eye */
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.042, 10, 8)), mgr._matHeadDark);
+    m.scale.set(0.70, 0.26, 1.45);
+    m.position.set(side * 0.140, 0.298, 0.22);
+    g.add(m);
+  }
+
+  /* dark postocular stripe: the near-black line every real anaconda carries
+   * from the eye back toward the jaw corner - visible from above and from
+   * the side, so it is built as geometry, not just texture */
+  for (side = -1; side <= 1; side += 2) {
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.028, 10, 8)), mgr._matPupil);
+    m.scale.set(0.50, 1.15, 2.3);
+    m.position.set(side * 0.195, 0.20, 0.135);
+    m.rotation.set(0.22, side * 0.10, 0);
+    g.add(m);
+  }
+
+  /* nostrils on top of the snout tip */
+  for (side = -1; side <= 1; side += 2) {
+    m = new T.Mesh(mgr._geo(new T.SphereGeometry(0.009, 8, 6)), mgr._matPupil);
+    m.position.set(side * 0.048, 0.178, 0.50);
+    g.add(m);
+  }
+
+  /* forked black tongue: a jointed chain so it can wave and curl.
+   * lives fully inside the mouth until a flick pushes it out. */
+  var tg = new T.Group();
+  tg.position.set(0, 0.075, 0.44);
+  this._tongueBaseZ = 0.44;
+  var LEN = [0.075, 0.083, 0.083, 0.075, 0.062, 0.052];
+  var RADr = [0.0143, 0.0117, 0.0096, 0.0078, 0.0062, 0.0049];
+  var parent = tg, segs = [];
+  for (var si = 0; si < LEN.length; si++) {
+    var sg = new T.Group();
+    if (si > 0) sg.position.z = LEN[si - 1];
+    var cyl = new T.Mesh(mgr._geo(new T.CylinderGeometry(RADr[si] * 0.86, RADr[si], LEN[si], 5)), mgr._matTongue);
+    cyl.geometry.translate(0, LEN[si] / 2, 0);
+    cyl.rotation.x = Math.PI / 2;
+    sg.add(cyl);
+    parent.add(sg);
+    segs.push(sg);
+    parent = sg;
+  }
+  /* the two fork prongs, spread animates */
+  var prongs = [];
+  for (side = -1; side <= 1; side += 2) {
+    var pr = new T.Group();
+    pr.position.z = LEN[LEN.length - 1];
+    pr.rotation.y = side * 0.22;
+    var fk = new T.Mesh(mgr._geo(new T.CylinderGeometry(0.0016, 0.0044, 0.11, 4)), mgr._matTongue);
+    fk.geometry.translate(0, 0.055, 0);
+    fk.rotation.x = Math.PI / 2;
+    pr.add(fk);
+    parent.add(pr);
+    prongs.push(pr);
+  }
+  tg.scale.z = 0.001;
+  g.add(tg);
+  this._tongueGrp = tg;
+  this._tongueSegs = segs;
+  this._tongueProngs = prongs;
+
+  mgr._root.add(g);
+  this._head = g;
+};
+
+AnacondaRig.prototype._buildShadows = function (mgr) {
+  var T = this._T, i;
+  /* one shared flat material; the geometry is baked flat on the ground
+   * (rotateX in the manager) and each quad is yawed along the body tangent */
+  this._shadows = [];
+  for (i = 0; i < N; i += 4) {
+    var s = new T.Mesh(mgr._shadowGeo, mgr._matShadow);
+    s.renderOrder = 1;
+    s.position.y = 0.006 + (i % 8) * 0.0008;
+    mgr._root.add(s);
+    this._shadows.push(s);
+  }
+};
+
+/* ---------------- v3.0 gait library ----------------
+ * One row per movement style. Parameters (all blending smoothly, so a
+ * gait change never pops):
+ *   waveK  spatial frequency of the locomotion wave (rad per ring)
+ *   waveA  lateral amplitude of the locomotion wave (u)
+ *   neck   rings over which the wave ramps in (the stiff neck leads,
+ *          the wave grows behind it - like a real snake pushing)
+ *   tailG  extra flexibility gain toward the tail tip (follow-through)
+ *   stride S-weave wavelength in metres of path per full S
+ *   weave  S-weave amplitude for the heading target (rad)
+ *   push   stride-synced surge of forward speed (0..x, subtle)
+ *   accel  how quickly speed approaches its target (per second)
+ * The wave phase itself advances with DISTANCE travelled (not time), so
+ * the wave is glued to the ground the animal crawls over, holds its pose
+ * when the snake stops, and is identical at 30 or 60 fps. WAVE_SLIP > 1
+ * makes the wave slip backward along the body slightly faster than the
+ * body moves - the muscular look of real lateral undulation. */
+var GAITS = {
+  rest:   { waveK: 0.34, waveA: 0.026, neck: 7,  tailG: 1.15, stride: 2.8,  weave: 0.00, push: 0.00, accel: 1.9 },
+  crawl:  { waveK: 0.46, waveA: 0.056, neck: 7,  tailG: 1.35, stride: 2.6,  weave: 0.46, push: 0.05, accel: 2.4 },
+  cruise: { waveK: 0.42, waveA: 0.050, neck: 8,  tailG: 1.30, stride: 2.3,  weave: 0.50, push: 0.05, accel: 2.8 },
+  fast:   { waveK: 0.36, waveA: 0.044, neck: 9,  tailG: 1.25, stride: 2.0,  weave: 0.38, push: 0.04, accel: 3.4 },
+  escape: { waveK: 0.34, waveA: 0.058, neck: 10, tailG: 1.45, stride: 1.85, weave: 0.28, push: 0.07, accel: 5.0 },
+  turn:   { waveK: 0.44, waveA: 0.034, neck: 6,  tailG: 1.30, stride: 2.4,  weave: 0.20, push: 0.03, accel: 2.8 }
+};
+var GAIT_KEYS = ['waveK', 'waveA', 'neck', 'tailG', 'stride', 'weave', 'push', 'accel'];
+var WAVE_SLIP = 1.6;             /* wave slips back along the body at 1.6x speed */
+
+/* ---------------- rig: state helpers ---------------- */
+AnacondaRig.prototype._setState = function (s, dur) {
+  this._state = s; this._stateT = 0;
+  if (s === 'idle') { this._idleDur = dur; this._nextLook = 0.3; }
+  if (s === 'run') this._runDur = dur;
+  if (s === 'freeze') this._freezeDur = dur;
+};
+
+/* flee from a ground point. panic=true full burst, false = reserved slide-away */
+AnacondaRig.prototype.scareFrom = function (pt, panic) {
+  if (this._state === 'run' && this._stateT < 0.5) return;
+  var P0 = this._P[0];
+  var dx = P0.x - pt.x, dz = P0.z - pt.z;
+  var L = Math.sqrt(dx * dx + dz * dz);
+  var tx, tz;
+  if (L < 1e-4) {
+    tx = P0.x + Math.sin(this._heading + Math.PI) * 4.0;
+    tz = P0.z + Math.cos(this._heading + Math.PI) * 4.0;
+  } else {
+    tx = P0.x + dx / L * 4.5;
+    tz = P0.z + dz / L * 4.5;
+  }
+  var d = Math.sqrt(tx * tx + tz * tz);
+  if (d > 6.2) { tx *= 6.2 / d; tz *= 6.2 / d; }
+  this._target = { x: tx, z: tz };
+  this._setState('run', panic ? 1.6 : 1.15);
+  /* prefers-reduced-motion: it still leaves, but hurries instead of panicking */
+  var panicV = this._mgr._reduced ? 0.8 : 2.3;
+  var calmV = this._mgr._reduced ? 0.7 : 1.55;
+  this._vTarget = (panic ? panicV : calmV) * (this._mgr._opts.speed || 1);
+  this._scareCd = 1.5;
+  this._afterFreeze = 'auto';
+};
+
+/* alert: stop, raise the head and stare at the disturbance */
+AnacondaRig.prototype.alertFrom = function (pt, dur, after) {
+  if (this._state === 'run') return;
+  this._alertPoint = { x: pt.x, z: pt.z };
+  this._afterFreeze = (this._afterFreeze === 'run' || after === 'run') ? 'run' : (after || 'auto');
+  var P0 = this._P[0];
+  var desired = Math.atan2(pt.x - P0.x, pt.z - P0.z);
+  /* the head yaws only gently on the neck: a rigid lofted skull cannot
+   * twist 45 degrees on a stationary neck without exposing the junction */
+  this._idleYawT = clamp(angDiff(desired, this._heading), -0.34, 0.34);
+  this._setState('freeze', dur || 1.0);
+};
+
+/* pick a wander target on the visible page, avoiding other snakes */
+AnacondaRig.prototype._pickTarget = function (mgr, minLen) {
+  var k, t;
+  for (k = 0; k < 12; k++) {
+    var lp = mgr._localFromNdc(rnd(-0.7, 0.7), rnd(-0.55, 0.48), mgr._tmpB);
+    if (!lp) break;
+    var L = Math.sqrt(lp.x * lp.x + lp.z * lp.z);
+    if (L <= minLen || L >= 5.6) continue;
+    for (t = 0; t < mgr._rigs.length; t++) {
+      var o = mgr._rigs[t];
+      if (o === this) continue;
+      var oh = o._P[0];
+      var dx = lp.x - oh.x, dz = lp.z - oh.z;
+      if (dx * dx + dz * dz < 2.6) { L = -1; break; }
+    }
+    if (L < 0) continue;
+    return { x: lp.x, z: lp.z };
+  }
+  return { x: rnd(-2, 2), z: rnd(-1.5, 2) };
+};
+
+AnacondaRig.prototype._chooseNext = function (mgr) {
+  if (!mgr._reduced && Math.random() < 0.12) {
+    this._target = this._pickTarget(mgr, 3.0);
+    this._setState('run', rnd(0.9, 1.5));
+    this._vTarget = 1.35 * (mgr._opts.speed || 1);
+  } else {
+    this._target = this._pickTarget(mgr, 0);
+    this._cruiseJit = rnd(-0.12, 0.16);
+    this._setState('walk', 0);
+  }
+};
+
+/* ---------------- rig: brain ---------------- */
+AnacondaRig.prototype._behavior = function (dt, time, mgr) {
+  this._stateT += dt;
+  this._scareCd -= dt;
+  var P0 = this._P[0];
+  var spd = mgr._opts.speed || 1;
+
+  /* shy: slide away when the cursor approaches head or body */
+  if (mgr._pointerLocal && mgr._opts.shy && !mgr._reduced && this._scareCd <= 0) {
+    var m = mgr._pointerLocal;
+    var near = false, close = false, i, q;
+    for (i = 0; i < N; i += 6) {
+      q = this._P[i];
+      var qx = q.x - m.x, qz = q.z - m.z;
+      var d2 = qx * qx + qz * qz;
+      if (d2 < (i === 0 ? 3.6 : 1.7)) { near = true; }
+      if (d2 < 0.85) { close = true; }
+      if (close) break;
+    }
+    if (near) this.scareFrom(m, close);
+  }
+
+  if (this._state === 'idle') {
+    this._vTarget = 0;
+    if (this._stateT > this._nextLook) {
+      /* v4.0: an aroused snake scans wider and more often; a resting one
+       * barely looks around. Blended from the arousal scalar, so it eases
+       * in and out with everything else. */
+      this._idleYawT = rnd(-0.30, 0.30) * (0.85 + 0.55 * this._arousal);
+      this._nextLook = this._stateT + rnd(0.9, 2.2) * (1.30 - 0.60 * this._arousal);
+    }
+    this._idleYaw += (this._idleYawT - this._idleYaw) * Math.min(1, dt * 2.5);
+    /* curiosity: a SLOW cursor just outside flee range reads as a scent
+     * trace - the snake watches it from a safe distance and samples the
+     * air with extra tongue flicks (fast cursor = threat, handled above) */
+    if (mgr._pointerLocal && mgr._ptrSlow > 0.6 && !mgr._reduced && this._scareCd <= 0) {
+      var cx = mgr._pointerLocal.x - P0.x, cz = mgr._pointerLocal.z - P0.z;
+      var cd = Math.sqrt(cx * cx + cz * cz);
+      if (cd > 1.9 && cd < 3.2) {
+        this._idleYawT = clamp(angDiff(Math.atan2(cx, cz), this._heading), -0.34, 0.34);
+        if (this._tongueNext > 0.9) this._tongueNext = rnd(0.35, 0.9);
+        this._curious += (1 - this._curious) * Math.min(1, dt * 3);
+      } else {
+        this._curious *= Math.exp(-3 * dt);
+      }
+    } else {
+      this._curious *= Math.exp(-3 * dt);
+    }
+    if (this._stateT > this._idleDur) this._chooseNext(mgr);
+  } else if (this._state === 'walk') {
+    /* real serpentine locomotion: the head does not run straight at the
+     * target, it carves an S-path. The weave phase advances with DISTANCE
+     * travelled (in step(), gait-stride driven), so the wavelength stays
+     * fixed in space (~2.3u) whatever the speed - the body chain then
+     * follows the path the head traced. At crawl speed the stride pulses
+     * gently (push-glide rhythm real snakes show at low speed). */
+    var pulse = Math.max(0, 1 - this._speed / 0.9) * (0.5 + 0.5 * Math.sin(time * 1.0 + this._seed));
+    this._vTarget = (0.42 + this._cruiseJit) * spd * (mgr._reduced ? 0.6 : 1) * (1 - 0.22 * pulse);
+    var tdx = this._target.x - P0.x, tdz = this._target.z - P0.z;
+    this._headingT = Math.atan2(tdx, tdz) + Math.sin(this._weavePh) * this._weaveAmp;
+    if (tdx * tdx + tdz * tdz < 0.45) this._setState('idle', rnd(1.6, 5.0));
+  } else if (this._state === 'run') {
+    var rdx = this._target.x - P0.x, rdz = this._target.z - P0.z;
+    this._headingT = Math.atan2(rdx, rdz) + Math.sin(this._weavePh) * this._weaveAmp;
+    if (this._stateT > this._runDur || rdx * rdx + rdz * rdz < 0.5) {
+      this._setState('idle', rnd(0.9, 2.4));
+      this._scareCd = 1.3;
+    }
+  } else { /* freeze: alert pose, head up, staring */
+    this._vTarget = 0;
+    this._idleYaw += (this._idleYawT - this._idleYaw) * Math.min(1, dt * 5);
+    if (this._stateT > this._freezeDur) {
+      var pending = this._afterFreeze;
+      this._afterFreeze = 'auto';
+      if (pending === 'run') {
+        this.scareFrom(this._alertPoint, true);
+      } else if (pending === 'walk' || Math.random() < 0.65) {
+        this._target = this._pickTarget(mgr, 0);
+        this._cruiseJit = rnd(-0.12, 0.16);
+        this._setState('walk', 0);
+      } else {
+        this._setState('idle', rnd(1.0, 2.2));
+      }
+    }
+  }
+
+  /* keep clear of the other snakes */
+  var rigs = mgr._rigs, i, o;
+  for (i = 0; i < rigs.length; i++) {
+    o = rigs[i];
+    if (o === this) continue;
+    var oh2 = o._P[0];
+    var sx = P0.x - oh2.x, sz = P0.z - oh2.z;
+    var d2h = sx * sx + sz * sz;
+    if (d2h < 2.6) {
+      var away = Math.atan2(sx, sz);
+      this._headingT += clamp(angDiff(away, this._heading), -1, 1) * dt * 2.5;
+    }
+  }
+
+  /* and never crawl into its own body */
+  this._selfAvoid(dt);
+};
+
+/* stay inside the visible page area */
+AnacondaRig.prototype._checkBounds = function (mgr) {
+  var v = this._vA.set(this._R[10].x, 0.3, this._R[10].z);
+  mgr._root.localToWorld(v);
+  v.project(mgr._camera);
+  if (v.x < -0.86 || v.x > 0.86 || v.y > 0.62 || v.y < -0.72) {
+    var lp = mgr._localFromNdc(0, -0.06, mgr._tmpB);
+    if (lp) {
+      this._target = { x: lp.x, z: lp.z };
+      if (this._state === 'idle') { this._cruiseJit = 0; this._setState('walk', 0); }
+    }
+  }
+};
+
+/* ---------------- rig: physics + pose ---------------- */
+AnacondaRig.prototype.step = function (dt, time, mgr) {
+  this._behavior(dt, time, mgr);
+
+  /* ---- v3.0 gait selection + blending ----
+   * The gait describes HOW the animal is moving right now; it is picked
+   * from the brain state, the current speed and how hard the heading
+   * target is pulling (a big pending turn = dedicated turning gait).
+   * Parameters blend at ~3.5/s, so a gait change is a transition, not
+   * a pop. */
+  var pending = Math.abs(angDiff(this._headingT, this._heading));
+  var gait;
+  if (this._state === 'idle' || this._state === 'freeze') gait = 'rest';
+  else if (this._state === 'walk') gait = pending > 0.9 ? 'turn' : (this._speed < 0.3 ? 'crawl' : 'cruise');
+  else gait = (this._speed > 1.5 && this._stateT < 0.8) ? 'escape' : (this._speed > 0.85 ? 'fast' : 'crawl');
+  if (mgr._reduced && gait === 'escape') gait = 'fast';   /* hurry, no burst */
+  this._gait = gait;
+  var tgt = GAITS[gait], gp = this._gp, bl = Math.min(1, dt * 3.5), gk, gi;
+  for (gi = 0; gi < GAIT_KEYS.length; gi++) {
+    gk = GAIT_KEYS[gi];
+    gp[gk] += (tgt[gk] - gp[gk]) * bl;
+  }
+  /* S-weave amplitude for the coming frames: gait base x slow organic
+   * drift (two out-of-phase LFOs - no two sweeps of the S are identical).
+   * A fleeing snake straightens out: the weave shrinks as speed rises. */
+  this._weaveAmp = gp.weave * (this._state === 'run' ? (1.05 - 0.30 * Math.min(this._speed / 2.0, 1)) : 1)
+    * (1 + 0.20 * Math.sin(time * 0.21 + this._seed) + 0.10 * Math.sin(time * 0.53 + this._seed * 2.1));
+
+  /* ---- turning: rate-limited angular velocity ----
+   * The turn rate accelerates and decelerates smoothly toward the rate
+   * the heading target asks for; nothing snaps. Turns therefore begin at
+   * the head, and the rest of the spine inherits them ring by ring
+   * through the chain follow below. */
+  var desired = angDiff(this._headingT, this._heading);
+  var turnCap = (this._state === 'run' ? 2.7 : 1.7) * (1.15 - 0.28 * Math.min(this._speed / 1.8, 1));
+  /* a heavy body cannot bend tighter than its speed allows: enforce a
+   * minimum turn radius (r = v / w) so panic coils never fold through
+   * themselves; at rest the cap eases to a gentle 0.5 rad/s */
+  turnCap = Math.min(turnCap, this._speed / 1.05 + 0.5);
+  var tAcc = this._state === 'run' ? 9.0 : 6.5;
+  var tgtRate = clamp(desired * 5.0, -turnCap, turnCap);
+  this._turnVel += clamp(tgtRate - this._turnVel, -tAcc * dt, tAcc * dt);
+  this._heading += this._turnVel * dt;
+  /* the head banks slightly INTO the turn it is carving */
+  this._roll += (clamp(this._turnVel, -3, 3) * 0.045 - this._roll) * Math.min(1, dt * 6);
+  this._prevHeading = this._heading;
+
+  /* speed approaches its target at the gait's own acceleration; threading
+   * through cramped space (own coil, another snake) eases the throttle -
+   * but a panic run never loses more than 30%, so the escape burst can
+   * always reach full sprint (relax + steering keep the coil open) */
+  var vEff = this._vTarget * (1 - (this._state === 'run' ? 0.30 : 0.45) * this._avoidSlow);
+  this._speed += (vEff - this._speed) * Math.min(1, dt * gp.accel);
+  if (this._speed < 0.002) this._speed = 0;
+
+  /* agitation drives the tail flick: full while fleeing, decays after
+   * (reduced-motion users never get the nervous flick) */
+  if (this._state === 'run' && !mgr._reduced) this._agitate = 1;
+  else this._agitate *= Math.exp(-1.6 * dt);
+  /* post-run panting: rises with sustained speed, fades slowly after */
+  var pantTgt = this._speed > 1.0 ? 1 : 0;
+  this._pant += (pantTgt - this._pant) * Math.min(1, dt * (pantTgt ? 2.5 : 0.7));
+
+  /* ---- locomotion ----
+   * push: a subtle surge synced to the wave phase (the body gains ground
+   * on the push half of each stride). The wave phases advance with
+   * DISTANCE, so they freeze with the animal and are fps-independent. */
+  var sn = clamp(this._speed / 2.0, 0, 1);
+  var push = mgr._reduced ? 0 : gp.push * sn;
+  var fx = Math.sin(this._heading), fz = Math.cos(this._heading);
+  var move = this._speed * dt * (1 + push * Math.sin(this._waveD - 0.8));
+  if (this._state === 'walk' || this._state === 'run') {
+    this._weavePh += (this._speed * dt / gp.stride) * TAU;
+    this._waveD += (this._speed * dt / SEG) * gp.waveK * WAVE_SLIP;
+  }
+  var P = this._P;
+  P[0].x += fx * move; P[0].z += fz * move;
+
+  /* spine chain follow (the body traces the path of the head) */
+  for (var i = 1; i < N; i++) {
+    var dx = P[i].x - P[i - 1].x, dz = P[i].z - P[i - 1].z;
+    var d = Math.sqrt(dx * dx + dz * dz);
+    if (d > 1e-6) {
+      var fr = SEG / d;
+      P[i].x = P[i - 1].x + dx * fr;
+      P[i].z = P[i - 1].z + dz * fr;
+    }
+  }
+
+  /* ---- gait-driven travelling wave ----
+   * The big S-curves come from the head's woven path (the chain above);
+   * this wave is the muscular layer on top: it travels front -> rear,
+   * ramps in over the stiff neck, and gains flexibility toward the tail.
+   * A per-ring low-pass (stiff neck -> loose tail) delays the offset ring
+   * by ring: the follow-through whip of the back half. */
+  this._phase += dt * TAU * (0.35 + this._speed * 0.5);
+  /* rest blends in smoothly (was a hard binary switch before v3.0); the
+   * locomotion wave fades out as the animal settles, the rest sway fades in */
+  this._idleAmt += ((this._speed < 0.1 ? 1 : 0) - this._idleAmt) * Math.min(1, dt * 2.2);
+  var idleAmt = this._idleAmt;
+  var redMul = mgr._reduced ? 0.65 : 1;
+  var amp = gp.waveA * (1 - 0.85 * idleAmt) * redMul
+    * (1 + 0.28 * Math.sin(time * 0.31 + this._seed) + 0.14 * Math.sin(time * 0.71 + this._seed * 1.7));
+
+  /* alert: raise the head and the front third of the body */
+  this._alert += (((this._state === 'freeze') ? 1 : 0) - this._alert) * Math.min(1, dt * 4);
+
+  var wSm = this._waveSm;
+  for (i = 0; i < N; i++) {
+    var a = P[i > 0 ? i - 1 : 0], b = P[i < N - 1 ? i + 1 : N - 1];
+    var sdx = b.x - a.x, sdz = b.z - a.z;
+    var sl = Math.sqrt(sdx * sdx + sdz * sdz) || 1;
+    sdx /= sl; sdz /= sl;
+    this._dirs[i].x = sdx; this._dirs[i].z = sdz;
+    var px = -sdz, pz = sdx;
+    var tt = i / (N - 1);
+    /* neck ramp-in, then growing flexibility toward the tail tip */
+    var env = i < gp.neck ? (i / gp.neck) : 1;
+    env = env * env * (3 - 2 * env);
+    var tailF = tt > 0.55 ? 1 + (tt - 0.55) * gp.tailG : 1;
+    var w = Math.sin(this._waveD - i * gp.waveK) * amp * env * tailF;
+    /* faint faster secondary ripple: keeps the surface from looking looped */
+    w += Math.sin(this._waveD * 1.7 - i * gp.waveK * 2.3 + 2.1) * amp * 0.35 * env;
+    /* per-ring follow-through: neck answers fast, tail lags and whips */
+    var ws = wSm[i], rate = 18 - 9 * tt;
+    ws += (w - ws) * Math.min(1, dt * rate);
+    wSm[i] = ws;
+    w = ws;
+    /* agitated tail flick: fast shimmer running down the last quarter */
+    if (this._agitate > 0.02 && i > N - 22) {
+      var tf = (i - (N - 22)) / 22;
+      w += Math.sin(time * 24 - i * 1.3) * 0.05 * this._agitate * tf;
+    }
+    if (idleAmt > 0.01) {
+      w += (Math.sin(time * 1.0 - i * 0.34) * 0.020
+        + Math.sin(time * 0.42 + this._seed - i * 0.12) * 0.009) * tailF * idleAmt;
+    }
+    var liftA = Math.max(this._alert, this._curious * 0.35);
+    var lift = liftA * 0.34 * Math.pow(Math.max(0, 1 - i / 13), 1.3);
+    var bob = sn * Math.sin(this._phase * 2 - i * 0.5) * 0.010;
+    this._R[i].set(P[i].x + px * w, 0.02 + lift + bob, P[i].z + pz * w);
+  }
+
+  /* self-intersection guard: gentle relaxation between render rings far
+   * apart along the spine but close in space (only coils produce these) */
+  this._relaxBody(dt);
+
+  /* ---- v4.0 arousal: one continuous calm <-> alert scalar ----
+   * Resting ~0.16, walking ~0.42, curious idle up to ~0.76, staring at a
+   * disturbance 0.85, fleeing 1.0. Blended at 2/s, so everything driven by
+   * it - tongue-flick rate, head scanning, breathing pace, head sway -
+   * eases between calm and alert instead of switching. */
+  var aTgt;
+  if (this._state === 'run') aTgt = 1.0;
+  else if (this._state === 'freeze') aTgt = 0.85;
+  else if (this._state === 'walk') aTgt = 0.42 + this._curious * 0.30;
+  else aTgt = 0.16 + this._curious * 0.60;
+  if (this._alert * 0.9 > aTgt) aTgt = this._alert * 0.9;
+  if (this._pant * 0.55 > aTgt) aTgt = this._pant * 0.55;
+  this._arousal += (aTgt - this._arousal) * Math.min(1, dt * 2.0);
+
+  this._updateBody(time, idleAmt, dt);
+  this._updateHead(time, sn, idleAmt);
+  this._updateYawn(dt);
+  this._updateTongue(dt, time);
+  this._updateShadows();
+  this._checkBounds(mgr);
+};
+
+/* keep the persistent spine path from folding through itself: two probe
+ * points ahead of the head sense the snake's own body; steering away from
+ * it is what keeps coils from being laid through each other (a real snake
+ * simply never crawls into its own coil). The probe distance grows with
+ * speed (a fast animal must see further ahead) and a near hit also dampens
+ * the speed - tightening the achievable turn radius, exactly how a real
+ * snake threads through cramped space. v4.0 adds two lateral probes: panic
+ * reversals can sweep the NECK sideways into the rear body, which straight
+ * ahead probes never see. Runs inside _behavior, so the turn dynamics in
+ * step() still smooth the resulting heading. */
+AnacondaRig.prototype._selfAvoid = function (dt) {
+  if (this._speed <= 0.15) return;
+  var P = this._P, P0 = P[0];
+  var hsin = Math.sin(this._heading), hcos = Math.cos(this._heading);
+  var pr, i, hit = 0;
+  for (pr = 0; pr < 2; pr++) {
+    var pd = (pr ? 1.8 : 0.8) + this._speed * (pr ? 0.55 : 0.30);
+    var ax = P0.x + hsin * pd, az = P0.z + hcos * pd;
+    for (i = 12; i < N - 4; i += 3) {
+      var qx = P[i].x - ax, qz = P[i].z - az;
+      var lim = (RAD[i] + (pr ? 0.55 : 0.42)) * (pr ? 0.85 : 0.88);
+      if (qx * qx + qz * qz < lim * lim) {
+        var away = Math.atan2(ax - P[i].x, az - P[i].z);
+        this._headingT += clamp(angDiff(away, this._heading), -1, 1) * dt * (pr ? 2.5 : 4.5);
+        if (pr === 0) hit = 1;
+        break;
+      }
+    }
+  }
+  /* lateral probe fan: two distances, each side - the outer pair catches
+   * the outgoing leg of a panic U-turn early, the inner pair covers the
+   * gap next to the head. Far body only (rings 28+): the near-trailing
+   * body always rides beside the head during an S-weave and must never
+   * read as an obstacle (it would throttle every run), while the mid/rear
+   * body beside the path is exactly the loop a U-turn is about to hit. */
+  var side, sl, so;
+  for (side = -1; side <= 1; side += 2) {
+    for (so = 0.45; so <= 1.05; so += 0.6) {
+      sl = 0.7 + this._speed * 0.25 + (so > 1 ? 0.5 : 0);
+      var lx = P0.x + hsin * sl - hcos * so * side;
+      var lz = P0.z + hcos * sl + hsin * so * side;
+      for (i = 28; i < N - 6; i += 3) {
+        var mx2 = P[i].x - lx, mz2 = P[i].z - lz;
+        var mlim = (RAD[i] + 0.38) * 0.85;
+        if (mx2 * mx2 + mz2 * mz2 < mlim * mlim) {
+          var maway = Math.atan2(lx - P[i].x, lz - P[i].z);
+          this._headingT += clamp(angDiff(maway, this._heading), -1, 1) * dt * 4.2;
+          /* throttle only when the far body is actually AHEAD of the nose
+           * (the incoming loop of a U-turn), and never during the first
+           * 0.9 s of a panic burst - the burst must always be allowed to
+           * reach full sprint; steering and relax still protect it */
+          var rxd = P[i].x - P0.x, rzd = P[i].z - P0.z;
+          var rlen = Math.sqrt(rxd * rxd + rzd * rzd) || 1;
+          if (rxd * hsin + rzd * hcos > 0.25 * rlen &&
+              !(this._state === 'run' && this._stateT < 0.9)) hit = 1;
+          break;
+        }
+      }
+    }
+  }
+  /* cramped space: ease off the throttle so the turn radius shrinks with
+   * it (smooth 0..1 factor, applied by the speed integrator in step) */
+  this._avoidSlow += ((hit ? 1 : 0) - this._avoidSlow) * Math.min(1, dt * 5);
+};
+
+/* relax overlaps between rings that are >= 10 rings apart along the spine
+ * but spatially close. The rope constraint only guarantees chain distance,
+ * so a coil lays loops against each other; this nudges them apart until
+ * they just touch (like a real coiled snake). Four fast Gauss-Seidel
+ * passes with a per-pair push cap, then a per-ring clamp: bounded, pop
+ * free, and strong enough to hold a coil open. The pair search runs to 60
+ * rings apart (v4.0, was 48): one full coil puts rings ~40 apart shoulder
+ * to shoulder, and a panic coil can also lay the rear body over the mid
+ * body (pairs up to ~55 apart). The head zone (rings 0-3, wrapped by the
+ * skull loft) is excluded. */
+AnacondaRig.prototype._relaxBody = function (dt) {
+  var R = this._R, rlxX = this._rlxX, rlxZ = this._rlxZ, i, j, p;
+  for (i = 0; i < N; i++) { rlxX[i] = R[i].x; rlxZ[i] = R[i].z; }
+  for (p = 0; p < 4; p++) {
+    /* ring N-18 onward is the thin tail: it is excluded from the guard on
+     * purpose - a real snake drapes its tail over its own coil, and the
+     * Stage 1 tail flick must stay free to whip without relax damping it */
+    var iEnd = N - 18;
+    for (i = 4; i < iEnd - 10; i++) {
+      var Ri = R[i];
+      var jEnd = i + 60 < iEnd ? i + 60 : iEnd;
+      for (j = i + 10; j < jEnd; j++) {
+        var dx = Ri.x - R[j].x, dz = Ri.z - R[j].z;
+        var ad = dx < 0 ? -dx : dx;
+        if (ad > 0.85) continue;
+        ad = dz < 0 ? -dz : dz;
+        if (ad > 0.85) continue;
+        var minD = (RAD[i] + RAD[j]) * 0.98;
+        var d2 = dx * dx + dz * dz;
+        if (d2 >= minD * minD || d2 < 1e-9) continue;
+        var d = Math.sqrt(d2);
+        /* the neck (visually critical, always on camera) gets a stronger
+         * push so a panic sweep can never drive it through the body */
+        var cap = (i < 16 || j < 16) ? 0.030 : 0.018;
+        var f = Math.min((minD - d) * 0.45, cap) / d;
+        var mx = dx * f, mz = dz * f;
+        Ri.x += mx; Ri.z += mz;
+        R[j].x -= mx; R[j].z -= mz;
+      }
+    }
+  }
+  /* apply the relax result through a per-ring LOW-PASS: the desired push
+   * offset ramps in/out at a bounded rate instead of snapping, so a panic
+   * coil is pushed apart just as hard as before but no ring ever JERKS -
+   * the applied offset changes at most ~0.035u per 1/60 s on top of smooth
+   * path motion. Without this, pushes that activate/deactivate between
+   * frames read as single-frame pops.
+   * v4.2: the desired push is first blurred along the spine (3-tap), so
+   * neighbouring rings always move by near-equal amounts - a push field
+   * that differed ring to ring used to fold small sawtooth ridges into
+   * the coil rim. The ramp cap is per-SECOND now, not per-frame: the push
+   * profile is identical at 30, 60 and 144 fps. */
+  var rtX = this._roTX, rtZ = this._roTZ;
+  for (i = 0; i < N; i++) { rtX[i] = R[i].x - rlxX[i]; rtZ[i] = R[i].z - rlxZ[i]; }
+  for (i = 0; i < N; i++) {
+    var iLo = i > 0 ? i - 1 : 0, iHi = i < N - 1 ? i + 1 : N - 1;
+    var tx = 0.25 * rtX[iLo] + 0.5 * rtX[i] + 0.25 * rtX[iHi];
+    var tz = 0.25 * rtZ[iLo] + 0.5 * rtZ[i] + 0.25 * rtZ[iHi];
+    /* the neck ramps faster: bursting out of a coiled rest drags it across
+     * the body, and it must be shoveled clear quickly */
+    var roRate = (i < 20 ? 3.0 : 2.1) * dt;
+    var ox = this._roX[i], oz = this._roZ[i];
+    var dxa = tx - ox, dza = tz - oz;
+    var mag = Math.sqrt(dxa * dxa + dza * dza);
+    if (mag > roRate) { dxa *= roRate / mag; dza *= roRate / mag; }
+    ox += dxa; oz += dza;
+    var om = Math.sqrt(ox * ox + oz * oz);
+    if (om > 0.22) { ox *= 0.22 / om; oz *= 0.22 / om; }   /* no windup */
+    this._roX[i] = ox; this._roZ[i] = oz;
+    R[i].x = rlxX[i] + ox;
+    R[i].z = rlxZ[i] + oz;
+  }
+  /* (v4.1: contact recording moved to _updateBody, where it runs on the
+   * smoothed VISUAL chain so the shading matches what is actually seen) */
+};
+
+/* rebuild the skin tube around the spine.
+ * Cross-section: slightly wider than tall with a flattened belly - the real
+ * animal is a heavy, ventrally flattened tube, and the flat bottom keeps it
+ * in contact with the ground. Toward the rear the section deepens and
+ * narrows (lateral compression of the back half and tail) and a subtle
+ * dorsal keel runs over the front-mid back, so the body never reads as a
+ * uniform tube. Normals are analytic (ring direction minus the taper slope
+ * along the tangent) instead of computeVertexNormals(): ~3x cheaper per
+ * frame and smoother on the tail taper. */
+AnacondaRig.prototype._updateBody = function (time, idleAmt, dt) {
+  var T = this._T, i, j, o;
+  var R = this._R, tang = this._tang, right = this._right, upv = this._upv;
+
+  /* v4.1: visual ring centers - lightly smoothed physics chain (see the
+   * constructor note). The smoothing weight ramps in from ring 4 so the
+   * rigid skull, which wraps rings 0-2, can never lose its junction. */
+  var Rv = this._Rv;
+  for (i = 0; i < N; i++) {
+    var ip = i > 0 ? i - 1 : 0, inx = i < N - 1 ? i + 1 : N - 1;
+    var wS = 0.30 * Math.min(1, Math.max(0, (i - 3) / 5));
+    Rv[i * 3] = R[i].x + wS * (0.5 * (R[ip].x + R[inx].x) - R[i].x);
+    Rv[i * 3 + 1] = R[i].y + wS * (0.5 * (R[ip].y + R[inx].y) - R[i].y);
+    Rv[i * 3 + 2] = R[i].z + wS * (0.5 * (R[ip].z + R[inx].z) - R[i].z);
+  }
+
+  for (i = 0; i < N; i++) {
+    var ap = (i > 0 ? i - 1 : 0) * 3, bp = (i < N - 1 ? i + 1 : N - 1) * 3;
+    var tx = Rv[bp] - Rv[ap], ty = Rv[bp + 1] - Rv[ap + 1], tz = Rv[bp + 2] - Rv[ap + 2];
+    var L = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+    tang[i].set(tx / L, ty / L, tz / L);
+  }
+  for (i = 0; i < N; i++) {
+    var tg = tang[i];
+    right[i].set(-tg.z, 0, tg.x).normalize();
+    upv[i].crossVectors(right[i], tg).normalize();
+  }
+
+  var pos = this._geo.attributes.position.array;
+  var nor = this._geo.attributes.normal.array;
+  var col = this._geo.attributes.color.array;
+  var ctA = this._ctA, ctNX = this._ctNX, ctNY = this._ctNY, ctNZ = this._ctNZ;
+  var ctW = this._ctW;   /* v4.2: direction-validity flags (see below) */
+
+  /* v4.1: record the strongest contact per ring on the VISUAL chain, for
+   * the flesh squash + crease shading below. Measured in 3D so a loop or
+   * the tail resting ON TOP of another registers too. Shading data only;
+   * it never moves a ring.
+   * v4.2: sampled at stride 1 - the old even-ring stride left half the
+   * rings unmeasured, so the raw field alternated along the spine and an
+   * even/odd ripple was baked in before smoothing even started. */
+  for (i = 0; i < N; i++) ctA[i] = 0;
+  for (i = 0; i < N - 12; i++) {
+    var cx0 = Rv[i * 3], cy0 = Rv[i * 3 + 1], cz0 = Rv[i * 3 + 2];
+    var rSum = RAD[i];
+    for (j = i + 12; j < N; j++) {
+      var dx = cx0 - Rv[j * 3], dy = cy0 - Rv[j * 3 + 1], dz = cz0 - Rv[j * 3 + 2];
+      if (dx > 0.85 || dx < -0.85 || dz > 0.85 || dz < -0.85) continue;
+      var sum = rSum + RAD[j];
+      var minD = sum * 1.02;
+      var d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 >= minD * minD || d2 < 1e-9) continue;
+      var d = Math.sqrt(d2);
+      /* 0 where the surfaces just touch, 1 at ~10% centre overlap; the
+       * ramp starts AT tangency so resting loops already shade clearly */
+      var c = (minD - d) / (sum * 0.10);
+      if (c <= 0) continue;
+      if (c > 1) c = 1;
+      /* v4.2: ctW marks whether the contact direction is geometrically
+       * meaningful. When a fresh loop lands almost exactly on an old one
+       * (separation a tiny fraction of the touching distance) the normal
+       * is numerical noise; the direction must then freeze instead of
+       * jittering frame to frame and kinking the squash. */
+      var wgt = d > minD * 0.25 ? 1 : 0;
+      var inv = 1 / d;
+      var nx = -dx * inv, ny = -dy * inv, nz = -dz * inv;
+      /* keep the deepest contact per ring; direction points at the partner */
+      if (c > ctA[i]) {
+        ctA[i] = c; ctNX[i] = nx; ctNY[i] = ny; ctNZ[i] = nz; ctW[i] = wgt;
+      }
+      if (c > ctA[j]) {
+        ctA[j] = c; ctNX[j] = -nx; ctNY[j] = -ny; ctNZ[j] = -nz; ctW[j] = wgt;
+      }
+    }
+  }
+
+  /* v4.2: make the contact field continuous before anything consumes it.
+   * 1) Temporal: strength eases toward the raw value with an exponential
+   *    in SECONDS (fast rise, slower decay), so touching or leaving never
+   *    pops the crease inside a single frame. The direction slerps toward
+   *    the raw direction, sign-matched against the stored one first - the
+   *    field is symmetric (it just points at the partner), so without the
+   *    sign match a partner switch could swing it 180 degrees at once.
+   *    Frames whose contact pair is too close to define a normal (ctW 0)
+   *    leave the stored direction untouched.
+   * 2) Spatial: a 5-tap binomial blur along the spine. Strength is
+   *    averaged directly; the direction is averaged strength-weighted and
+   *    sign-aligned to the ring's own direction first, so rings pointing
+   *    at opposite partners merge into one stable pressed area instead of
+   *    cancelling to zero and re-randomizing. Neighbouring rings now get
+   *    near-equal squash and shading - an overlap reads as one smooth
+   *    dent, never as a scalloped rim. */
+  var ctASm = this._ctASm, ctNXs = this._ctNXs, ctNYs = this._ctNYs, ctNZs = this._ctNZs;
+  var ctA2 = this._ctA2, ctNX2 = this._ctNX2, ctNY2 = this._ctNY2, ctNZ2 = this._ctNZ2;
+  var kRise = 1 - Math.exp(-dt * 16), kFall = 1 - Math.exp(-dt * 4.5);
+  var kDir = Math.min(1, dt * 14);
+  for (i = 0; i < N; i++) {
+    var cRaw = ctA[i], cSm = ctASm[i];
+    cSm += (cRaw - cSm) * (cRaw > cSm ? kRise : kFall);
+    if (cSm < 0.003) cSm = 0;
+    ctASm[i] = cSm;
+    if (cRaw > 0.001 && ctW[i]) {
+      var dotD = ctNX[i] * ctNXs[i] + ctNY[i] * ctNYs[i] + ctNZ[i] * ctNZs[i];
+      var sgn = dotD < 0 ? -1 : 1;
+      var vx2 = ctNXs[i] + (ctNX[i] * sgn - ctNXs[i]) * kDir;
+      var vy2 = ctNYs[i] + (ctNY[i] * sgn - ctNYs[i]) * kDir;
+      var vz2 = ctNZs[i] + (ctNZ[i] * sgn - ctNZs[i]) * kDir;
+      var vl2 = Math.sqrt(vx2 * vx2 + vy2 * vy2 + vz2 * vz2) || 1;
+      ctNXs[i] = vx2 / vl2; ctNYs[i] = vy2 / vl2; ctNZs[i] = vz2 / vl2;
+    }
+  }
+  var W5 = [1, 4, 6, 4, 1];
+  for (i = 0; i < N; i++) {
+    var sAcc = 0, k5, ii5;
+    for (k5 = 0; k5 < 5; k5++) {
+      ii5 = i + k5 - 2;
+      ii5 = ii5 < 0 ? 0 : (ii5 > N - 1 ? N - 1 : ii5);
+      sAcc += W5[k5] * ctASm[ii5];
+    }
+    ctA2[i] = sAcc * 0.0625;
+    var cxi = ctNXs[i], cyi = ctNYs[i], czi = ctNZs[i];
+    var ax = 0, ay = 0, az = 0, aw = 0;
+    for (k5 = 0; k5 < 5; k5++) {
+      ii5 = i + k5 - 2;
+      ii5 = ii5 < 0 ? 0 : (ii5 > N - 1 ? N - 1 : ii5);
+      var wk = W5[k5] * ctASm[ii5];
+      if (wk < 1e-4) continue;
+      var dx5 = ctNXs[ii5], dy5 = ctNYs[ii5], dz5 = ctNZs[ii5];
+      if (dx5 * cxi + dy5 * cyi + dz5 * czi < 0) { dx5 = -dx5; dy5 = -dy5; dz5 = -dz5; }
+      ax += wk * dx5; ay += wk * dy5; az += wk * dz5; aw += wk;
+    }
+    if (aw > 1e-4) {
+      var al5 = 1 / (Math.sqrt(ax * ax + ay * ay + az * az) || 1);
+      ctNX2[i] = ax * al5; ctNY2[i] = ay * al5; ctNZ2[i] = az * al5;
+    } else {
+      ctNX2[i] = cxi; ctNY2[i] = cyi; ctNZ2[i] = czi;
+    }
+  }
+  var per = RADIAL + 1;
+  /* breathing: always faintly visible, deepest at rest, heaviest while
+   * panting after a burst (rib expansion over the front third). v4.0: a
+   * resting snake breathes SLOWLY and deeply; arousal quickens the pace. */
+  var brA = 0.012 + idleAmt * 0.026 + this._pant * 0.05;
+  var brF = 1.55 + this._arousal * 0.9 + this._pant * 2.2;
+  /* travelling muscle bulge while crawling (subtle, strongest mid-body) */
+  var rippleA = 0.016 * (0.25 + 0.75 * Math.min(this._speed / 1.2, 1));
+  var HV = 0.94;    /* vertical squash: slightly wider than tall      */
+  var BF = 0.90;    /* extra flatten factor at the belly (up < 0)     */
+  var BOT = 0.80 * HV * BF;   /* vertical offset of the lowest point  */
+  for (i = 0; i < N; i++) {
+    var breath = Math.sin(time * brF - i * 0.3) * brA * Math.max(0, 1 - i / 24);
+    var ripple = Math.sin(time * 2.6 - i * 0.52) * rippleA * Math.max(0.25, Math.min(1, i / 14)) *
+                 Math.max(0, 1 - i / (N - 16));
+    var r = RAD[i] * (1 + breath + ripple);
+    var cy = Rv[i * 3 + 1] + r * BOT;
+    var rx = right[i].x, ry = right[i].y, rz = right[i].z;
+    var ux = upv[i].x, uy = upv[i].y, uz = upv[i].z;
+    var cx = Rv[i * 3], cz = Rv[i * 3 + 2];
+    /* taper tilt for the analytic normals */
+    var rs = RSLOPE[i] * 0.95;
+    var tX = tang[i].x, tY = tang[i].y, tZ = tang[i].z;
+    /* anatomy along the length: posterior lateral compression (rear body
+     * and tail narrow while keeping their depth) and a gentle dorsal keel
+     * over the front-mid back */
+    var tt = i / (N - 1);
+    var s2 = tt > 0.58 ? (tt - 0.58) / 0.42 : 0;
+    s2 = s2 * s2 * (3 - 2 * s2);
+    var lat = 1 - 0.20 * s2;
+    var pk = Math.sin(Math.PI * clamp((tt - 0.10) / 0.55, 0, 1));
+    for (j = 0; j <= RADIAL; j++) {
+      var up = COSR[j], sn = SINR[j];
+      var vf = up < 0 ? HV - (1 - HV) * (-up) * 2.2 : HV;   /* belly flatten */
+      var vf2 = up < 0 ? 1 + (1 - vf) * 0.55 : 1;           /* keep girth    */
+      var cs = up * r * 0.80 * vf;    /* up component   */
+      var sn2 = sn * r * vf2;         /* right component */
+      if (up > 0.55) cs *= 1 + 0.06 * pk * (up - 0.55) / 0.45;   /* keel  */
+      /* v4.1: a loop pressed against another slimms like squeezed flesh;
+       * this also pulls in the jagged per-ring scallops the coil rim
+       * otherwise shows. Contact data is zero in free crawl: no effect. */
+      sn2 *= lat * (1 - 0.12 * ctA2[i]);                         /* taper */
+      /* v4.1: flesh squash + crease shading where the body lies over
+       * itself. The cross-section compresses toward the touching ring and
+       * mushes out sideways, like pressed muscle; vertices near the
+       * contact line darken (fake ambient occlusion), which is the cue
+       * that makes one loop read as resting ON another instead of two
+       * rigid pipes intersecting. Applied to the position offset AND the
+       * analytic normal (same linear map), so the flattened face shades
+       * correctly. */
+      var vx = rx * sn2 + ux * cs;
+      var vy = ry * sn2 + uy * cs;
+      var vz = rz * sn2 + uz * cs;
+      var ao = 1;
+      var cti = ctA2[i];
+      if (cti > 0.01) {
+        var dot = vx * ctNX2[i] + vy * ctNY2[i] + vz * ctNZ2[i];
+        if (dot > 0) {
+          var al = dot / r;                       /* 0..1 alignment   */
+          var s = 1 - 0.55 * cti * al * al;       /* squash factor    */
+          var kk = dot * (1 - s);
+          vx -= ctNX2[i] * kk; vy -= ctNY2[i] * kk; vz -= ctNZ2[i] * kk;
+          var bw = r * 0.12 * cti * al * al;      /* lateral mush-out */
+          vx -= ctNZ2[i] * bw; vz += ctNX2[i] * bw;
+          ao = 1 - cti * (0.34 * al + 0.30 * al * al * al);
+        }
+      }
+      o = (i * per + j) * 3;
+      pos[o]     = cx + vx;
+      pos[o + 1] = cy + vy;
+      pos[o + 2] = cz + vz;
+      col[o] = ao; col[o + 1] = ao; col[o + 2] = ao;
+      /* analytic normal = squashed radial direction tilted against the taper */
+      var nX = vx - tX * rs;
+      var nY = vy - tY * rs;
+      var nZ = vz - tZ * rs;
+      var nL = 1 / (Math.sqrt(nX * nX + nY * nY + nZ * nZ) || 1);
+      nor[o] = nX * nL; nor[o + 1] = nY * nL; nor[o + 2] = nZ * nL;
+    }
+  }
+  this._geo.attributes.position.needsUpdate = true;
+  this._geo.attributes.normal.needsUpdate = true;
+  this._geo.attributes.color.needsUpdate = true;
+
+  /* tail tip */
+  var tn = tang[N - 1];
+  this._tip.position.set(Rv[(N - 1) * 3] + tn.x * 0.05, Rv[(N - 1) * 3 + 1] + 0.02, Rv[(N - 1) * 3 + 2] + tn.z * 0.05);
+  this._tip.rotation.y = Math.atan2(tn.x, tn.z);
+};
+
+AnacondaRig.prototype._updateHead = function (time, sn, idleAmt) {
+  var h = this._head;
+  var R0 = this._R[0], d0 = this._dirs[0];
+  /* _dirs point tail-ward (they are b - a along the spine); the head must
+   * face the motion. The lofted skull's origin sits at the first neck ring
+   * and its rear stations wrap rings 0-2, so the junction stays seamless */
+  var fx = -d0.x, fz = -d0.z;
+  h.position.set(R0.x + fx * 0.04, R0.y, R0.z + fz * 0.04);
+  /* head leads the movement: the nose already points into the turn the
+   * heading target is asking for, while the neck is still catching up
+   * (a real snake's head initiates every change of direction) */
+  h.rotation.y = Math.atan2(fx, fz)
+    + clamp(angDiff(this._headingT, this._heading), -0.5, 0.5) * 0.30 * (0.35 + 0.65 * sn)
+    + this._idleYaw * (this._idleAmt * 0.75 + 0.25);
+  h.rotation.x = -0.03 - (this._alert + this._curious * 0.28) * 0.28 - this._yawnOpen * 0.14
+    + Math.sin(time * (1.7 + this._arousal * 1.1 + this._pant * 2.2)) * (0.008 * idleAmt + 0.016 * this._pant);
+  h.rotation.z = -this._roll + Math.sin(this._phase - 0.5) * 0.035 * sn;
+};
+
+/* occasional jaw yawn: real snakes stretch their gape after resting.
+ * A one-shot envelope opens the jaw wide (with the dark mouth interior
+ * showing) and closes it; aborted instantly if the snake is disturbed. */
+AnacondaRig.prototype._updateYawn = function (dt) {
+  if (this._yawnT > 0) {
+    if (this._state === 'run' || this._state === 'freeze') {
+      this._yawnT = 0; this._yawnOpen = 0;
+      return;
+    }
+    this._yawnT -= dt;
+    var t = 1 - Math.max(this._yawnT, 0) / this._yawnDur;
+    var e = Math.sin(Math.min(t, 1) * Math.PI);
+    this._yawnOpen = e * e * (3 - 2 * e) * 0.85;
+  } else {
+    this._yawnOpen = 0;
+    if (this._state === 'idle' && this._speed < 0.06) {
+      this._yawnNext -= dt * (this._mgr._reduced ? 0.55 : 1);
+      if (this._yawnNext <= 0) {
+        this._yawnT = this._yawnDur;
+        this._yawnNext = rnd(18, 40);
+        this._tongueT = 0;                    /* the gape keeps the tongue in */
+        this._tongueNext = 2.2;
+      }
+    }
+  }
+};
+
+AnacondaRig.prototype._updateTongue = function (dt, time) {
+  var g = this._tongueGrp, segs = this._tongueSegs, i;
+  /* v4.0: arousal drives the flick cycle - an alert or curious snake
+   * samples the air often, briefly and in chains; a resting one flicks
+   * rarely and slowly. The envelope below (slide out -> sample -> retreat)
+   * is unchanged and stays biologically shaped. */
+  var ar = this._arousal;
+  if (this._yawnT > 0) {          /* yawning: tongue stays in, jaw wide */
+    g.scale.z = 0.001;
+    g.position.z = this._tongueBaseZ;
+    this._jawOpen += (this._yawnOpen * 0.50 - this._jawOpen) * Math.min(1, dt * 7);
+    this._jawPivot.rotation.x = this._jawOpen;
+    return;
+  }
+  this._tongueNext -= dt;
+  if (this._tongueT > 0) {
+    this._tongueT -= dt;
+    var D = this._tongueDur;
+    var t = 1 - Math.max(this._tongueT, 0) / D;       /* 0..1 through the flick */
+    var ext, wave;
+    if (t < 0.20) {                                   /* slide out of the mouth */
+      var e = t / 0.20;
+      ext = e * e * (3 - 2 * e);
+      wave = 0;
+    } else if (t > 0.70) {                            /* retreat deep inside */
+      var r2 = (t - 0.70) / 0.30;
+      ext = 1 - r2 * r2 * r2;
+      wave = 0;
+    } else {                                          /* scent-sampling: bob + S-wave */
+      ext = 0.88 + 0.12 * Math.sin((t - 0.20) * (19 + 9 * ar) + this._tongueSeed);
+      wave = 1;
+    }
+    ext = clamp(ext, 0.001, 1);
+    g.scale.z = Math.max(0.001, ext);
+    g.position.z = this._tongueBaseZ + 0.035 * ext;   /* root rides out with the tongue */
+    var amp = (0.22 + 0.85 * ext) * (0.18 + 0.62 * wave);
+    for (i = 0; i < segs.length; i++) {
+      var ph = time * (9.5 + 4.0 * ar) - i * 0.95 + this._tongueSeed;
+      segs[i].rotation.y = Math.sin(ph) * amp * (0.30 + 0.14 * i);
+      segs[i].rotation.x = Math.sin(ph * 0.63 + 1.3) * amp * 0.38 * (0.18 + 0.11 * i);
+    }
+    var spread = 0.22 + 0.26 * ext + 0.10 * Math.sin(time * (11.5 + 5 * ar) + this._tongueSeed) * wave;
+    this._tongueProngs[0].rotation.y = spread;
+    this._tongueProngs[1].rotation.y = -spread;
+    if (this._tongueT <= 0) {
+      g.scale.z = 0.001;
+      g.position.z = this._tongueBaseZ;
+      for (i = 0; i < segs.length; i++) { segs[i].rotation.y = 0; segs[i].rotation.x = 0; }
+      /* real snakes flick twice or three times in a row - queue a fast
+       * repeat before the next slow cycle; chains get likelier as arousal
+       * rises, and the next interval lerps calm -> alert with arousal */
+      if (this._tongueRe > 0) {
+        this._tongueRe--;
+        this._tongueNext = 0.16;
+      } else {
+        this._tongueNext = ((2.3 + Math.random() * 3.4) * (1 - ar)
+          + (0.5 + Math.random() * 0.95) * ar) * (this._mgr._reduced ? 1.8 : 1);
+      }
+    }
+  } else if (this._tongueNext <= 0) {
+    /* an aroused snake favours quick flicks over long ones */
+    var st = Math.random() - ar * 0.30;
+    if (st < 0) st = 0;
+    this._tongueDur = st < 0.30 ? 0.55 : st < 0.62 ? 0.9 : st < 0.85 ? 1.5 : 1.9;
+    this._tongueSeed = Math.random() * 10;
+    this._tongueT = this._tongueDur;
+    this._tongueRe = Math.random() < 0.30 + ar * 0.40 ? (Math.random() < 0.4 ? 2 : 1) : 0;
+  }
+  /* jaw gapes in sync: slightly open while the tongue is out */
+  var out = clamp(g.scale.z * 2.2, 0, 1);
+  var tgt = out * 0.10 + this._alert * 0.03;
+  this._jawOpen += (tgt - this._jawOpen) * Math.min(1, dt * 12);
+  this._jawPivot.rotation.x = this._jawOpen;
+};
+
+AnacondaRig.prototype._updateShadows = function () {
+  var k = 0;
+  for (var i = 0; i < N; i += 4) {
+    var s = this._shadows[k++];
+    var R = this._R[i];
+    s.position.x = R.x; s.position.z = R.z;
+    /* yaw each flat quad along the local body tangent and stretch it, so
+     * the shadow reads as a soft directional contact line, not a blob;
+     * the raised front third shrinks and softens its shadow (sell the lift) */
+    var d = this._dirs[i];
+    s.rotation.y = Math.atan2(-d.z, d.x);
+    var lift = Math.max(this._alert, this._curious * 0.35) * Math.max(0, 1 - i / 13);
+    var sc = RAD[i] * 3.8 * (1 - lift * 0.45);
+    s.scale.set(sc * 1.55, 1, sc);
+  }
+};
+
+/* ---------------- manager: scene, events, loop ---------------- */
+function AnacondaWalk(userOpts) {
+  var k, i;
+  this._normalizeOpts(userOpts);
+
+  var T = ROOT.THREE;
+  if (!T) throw new Error('AnacondaWalk: three.js is not loaded.');
+  this._T = T;
+  this._headless = !!this.opts.headless;
+  this._destroyed = false;
+  this._hidden = false;
+
+  /* resource registries: everything GPU-side is tracked so destroy()
+   * can free it all (geometries, materials, textures) */
+  this._geos = [];
+  this._mats = [];
+  this._texs = [];
+
+  /* quality tier: phones / low-memory devices get half-resolution texture
+   * generation and a lighter tube mesh */
+  this._tier = { low: false };
+  try {
+    if (typeof navigator !== 'undefined') {
+      var coarsePtr = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+      var lowMem = !!(navigator.deviceMemory && navigator.deviceMemory <= 4);
+      var fewCores = !!(navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4);
+      this._tier.low = !!(coarsePtr || lowMem || fewCores);
+    }
+  } catch (e) {}
+  setRadial(this._tier.low ? 14 : 18);
+
+  var scene = new T.Scene();
+  var camera = new T.PerspectiveCamera(36, 1.7778, 0.1, 120);
+  camera.position.set(0, 12.5, 7.0);
+  camera.lookAt(0, 0, 0.6);
+  camera.updateMatrixWorld();
+  camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+  camera.matrixAutoUpdate = false;      /* static camera: skip per-frame matrix work */
+  this._scene = scene; this._camera = camera;
+
+  var root = new T.Group();
+  root.scale.setScalar(this._computeScale(1.7778));
+  root.updateMatrix();
+  root.matrixAutoUpdate = false;        /* only re-composed on resize */
+  scene.add(root);
+  this._root = root;
+
+  /* lights tuned for a glossy, wet-looking dark snake */
+  scene.add(new T.HemisphereLight(0xd8e8f0, 0x2a2e1c, 0.85));
+  var key = new T.DirectionalLight(0xfff3da, 1.15); key.position.set(4, 9, 4); scene.add(key);
+  var rim = new T.DirectionalLight(0xa8c8ff, 0.5); rim.position.set(-6, 5, -5); scene.add(rim);
+  var fill = new T.DirectionalLight(0xffe8c8, 0.32); fill.position.set(2, 4, 8); scene.add(fill);
+
+  /* shared resources */
+  var mk = this._makeCanvas.bind(this);
+  this._envMap = this._tex(makeEnvMap(T, mk));
+  var skin = makeSkinTextures(T, mk, this._tier);
+  /* v4.0: one fine scale normal map shared by the skull loft and the jaw */
+  var headNrm = this._tex(makeHeadNormalTexture(T, mk));
+  this._matSkin = this._mat(new T.MeshStandardMaterial({
+    map: this._tex(skin.map), normalMap: this._tex(skin.normalMap),
+    normalScale: new T.Vector2(0.85, 0.85),
+    roughness: 0.62, metalness: 0.0,
+    roughnessMap: this._tex(skin.roughnessMap),
+    envMap: this._envMap, envMapIntensity: 0.5,
+    vertexColors: true   /* v4.1: contact shading where the body overlaps */
+  }));
+  this._matHead = this._mat(new T.MeshStandardMaterial({
+    map: this._tex(makeHeadTexture(T, mk)),
+    normalMap: headNrm, normalScale: new T.Vector2(0.42, 0.42),
+    roughness: 0.55, metalness: 0.0,
+    envMap: this._envMap, envMapIntensity: 0.26
+  }));
+  /* plain dark olive for anatomy sub-meshes (collar, cheeks, ridges): they
+   * must NOT sample the head texture, or each sphere paints its own copy of
+   * the pale crown patch and reads as a second, flipped head */
+  this._matHeadDark = this._mat(new T.MeshStandardMaterial({
+    color: 0x232816, roughness: 0.55, metalness: 0.0,
+    envMap: this._envMap, envMapIntensity: 0.2
+  }));
+  this._matJaw = this._mat(new T.MeshStandardMaterial({
+    map: this._tex(makeJawTexture(T, mk)),
+    normalMap: headNrm, normalScale: new T.Vector2(0.30, 0.30),
+    roughness: 0.55, metalness: 0.0
+  }));
+  this._matEye = this._mat(new T.MeshStandardMaterial({
+    map: this._tex(makeEyeTexture(T, mk)), roughness: 0.18, metalness: 0.0,
+    envMap: this._envMap, envMapIntensity: 0.45
+  }));
+  this._matPupil = this._mat(new T.MeshPhongMaterial({ color: 0x0c0804, specular: 0x888888, shininess: 60 }));
+  this._matGlint = this._mat(new T.MeshBasicMaterial({ color: 0xffffff }));
+  this._matTongue = this._mat(new T.MeshPhongMaterial({ color: 0x1c1014, specular: 0x886666, shininess: 70 }));
+  this._matShadow = this._mat(new T.MeshBasicMaterial({
+    map: this._tex(makeShadowTexture(T, mk)), transparent: true, opacity: 0.24, depthWrite: false
+  }));
+  this._tipGeo = this._geo(new T.SphereGeometry(0.03, 8, 6));
+  /* contact shadows lie FLAT on the ground (baked rotation), then each quad
+   * is yawed along the body tangent at runtime */
+  this._shadowGeo = this._geo(new T.PlaneGeometry(1, 1));
+  this._shadowGeo.rotateX(-Math.PI / 2);
+
+  /* helpers */
+  this._raycaster = new T.Raycaster();
+  this._plane = new T.Plane(new T.Vector3(0, 1, 0), 0);
+  this._v2 = new T.Vector2();
+  this._tmpB = new T.Vector3();
+
+  /* adaptive quality state (pixel ratio steps down on slow devices) */
+  var dprCap = 2;
+  try { dprCap = this._tier.low ? 1.75 : 2; } catch (e) {}
+  this._q = { cap: dprCap, dpr: dprCap, acc: 0, n: 0, cool: 0 };
+
+  /* prefers-reduced-motion: honoured live (follows OS changes) */
+  this._reduced = false;
+  this._mq = null; this._mqChange = null; this._mqUnbind = null;
+  try {
+    if (typeof window !== 'undefined' && window.matchMedia) {
+      this._mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+      this._reduced = !!this._mq.matches;
+      var self = this;
+      if (typeof this._mq.addEventListener === 'function') {
+        this._mqChange = function (ev) { self._reduced = !!ev.matches; };
+        this._mq.addEventListener('change', this._mqChange);
+        this._mqUnbind = (function (mq, fn) { return function () { mq.removeEventListener('change', fn); }; })(this._mq, this._mqChange);
+      } else if (typeof this._mq.addListener === 'function') {
+        this._mqChange = function (ev) { self._reduced = !!ev.matches; };
+        this._mq.addListener(this._mqChange);
+        this._mqUnbind = (function (mq, fn) { return function () { mq.removeListener(fn); }; })(this._mq, this._mqChange);
+      }
+    }
+  } catch (e) {}
+
+  /* how many snakes? (touch devices: max 2, for the GPU budget) */
+  var maxN = this._tier.low ? 2 : 3;
+  var count = clamp(Math.round(this.opts.count), 1, maxN);
+
+  /* spawn snakes apart from each other */
+  this._rigs = [];
+  var spawns = [];
+  for (i = 0; i < count; i++) {
+    var s, tries = 0;
+    do {
+      s = { x: rnd(-2.4, 2.4), z: rnd(-1.8, 2.2), h: rnd(0, TAU), stagger: i * 0.9 + rnd(0, 0.5) };
+      tries++;
+    } while (tries < 25 && spawns.some(function (o) {
+      var dx = o.x - s.x, dz = o.z - s.z;
+      return dx * dx + dz * dz < 6.0;
+    }));
+    spawns.push(s);
+    this._rigs.push(new AnacondaRig(this, s));
+  }
+
+  /* interaction state */
+  this._pointer = null;
+  this._pointerLocal = null;
+  this._ptrPrev = null;
+  this._ptrSlow = 0;
+  this._scrollEnergy = 0;
+  this._lastScrollY = 0;
+  this._lastScrollEvt = 0;
+  this._time = 0;
+  this._rafId = 0;
+
+  if (!this._headless) this._initDom();
+}
+
+/* ---------------- configuration ----------------
+ * Only known keys are accepted, numbers are coerced and clamped to safe
+ * ranges, so a bad AnacondaConfig can never crash the animation. */
+AnacondaWalk.prototype._normalizeOpts = function (userOpts) {
+  var out = {}, k;
+  for (k in DEFAULTS) out[k] = DEFAULTS[k];
+  if (userOpts) {
+    for (k in userOpts) if (k in DEFAULTS) out[k] = userOpts[k];
+  }
+  function num(v, d) {
+    v = parseFloat(v);
+    return isFinite(v) ? v : d;
+  }
+  out.scale = clamp(num(out.scale, 1), 0.4, 2.5);
+  out.speed = clamp(num(out.speed, 1), 0.2, 3);
+  out.count = Math.max(1, Math.round(clamp(num(out.count, 1), 1, 3)));
+  out.zIndex = Math.round(clamp(num(out.zIndex, 9998), 0, 2147483000));
+  out.shy = !!out.shy && out.shy !== 'false';
+  out.reactToClick = !!out.reactToClick && out.reactToClick !== 'false';
+  out.reactToScroll = !!out.reactToScroll && out.reactToScroll !== 'false';
+  out.headless = !!out.headless;
+  this.opts = out;
+  this._opts = out;
+};
+
+AnacondaWalk.prototype._computeScale = function (aspect) {
+  return clamp(0.42 + 0.48 * aspect, 0.60, 1.45) * (this.opts.scale || 1);
+};
+
+/* resource registry helpers */
+AnacondaWalk.prototype._geo = function (g) { this._geos.push(g); return g; };
+AnacondaWalk.prototype._mat = function (m) { this._mats.push(m); return m; };
+AnacondaWalk.prototype._tex = function (t) { this._texs.push(t); return t; };
+
+AnacondaWalk.prototype._makeCanvas = function (w, h) {
+  if (typeof document !== 'undefined') {
+    var c = document.createElement('canvas'); c.width = w; c.height = h; return c;
+  }
+  return { width: w, height: h }; /* headless stub */
+};
+
+AnacondaWalk.prototype._worldFromNdc = function (nx, ny, out) {
+  this._v2.set(nx, ny);
+  this._raycaster.setFromCamera(this._v2, this._camera);
+  return this._raycaster.ray.intersectPlane(this._plane, out);
+};
+
+AnacondaWalk.prototype._localFromNdc = function (nx, ny, out) {
+  var w = this._worldFromNdc(nx, ny, this._tmpB);
+  if (!w) return null;
+  return this._root.worldToLocal(out.copy(w));
+};
+
+/* ---------------- interaction events ---------------- */
+AnacondaWalk.prototype._onPointerMove = function (ev) {
+  /* reused object: pointermove fires at very high rates, do not allocate */
+  var p = this._ptrEvt || (this._ptrEvt = { x: 0, y: 0 });
+  p.x = (ev.clientX / window.innerWidth) * 2 - 1;
+  p.y = -(ev.clientY / window.innerHeight) * 2 + 1;
+  this._pointer = p;
+};
+
+/* click / tap: the snake near the click flees, a distant one just watches */
+AnacondaWalk.prototype._clickAtNdc = function (nx, ny) {
+  if (!this.opts.reactToClick) return;
+  var pt = this._localFromNdc(nx, ny, this._tmpB);
+  if (!pt) return;
+  for (var i = 0; i < this._rigs.length; i++) {
+    var rig = this._rigs[i];
+    var near = false;
+    for (var j = 0; j < N; j += 5) {
+      var q = rig._P[j];
+      var dx = q.x - pt.x, dz = q.z - pt.z;
+      if (dx * dx + dz * dz < 2.6) { near = true; break; }
+    }
+    if (near) rig.scareFrom(pt, true);
+    else if (!this._reduced) rig.alertFrom(pt, rnd(0.6, 1.2));
+  }
+};
+
+AnacondaWalk.prototype._onPointerDown = function (ev) {
+  this._clickAtNdc(
+    (ev.clientX / window.innerWidth) * 2 - 1,
+    -(ev.clientY / window.innerHeight) * 2 + 1
+  );
+};
+
+/* scroll: freeze and watch (prey instinct); heavy scrolling spooks it */
+AnacondaWalk.prototype._scrollPulse = function (deltaY) {
+  this._scrollEnergy += Math.abs(deltaY);
+  if (!this.opts.reactToScroll) return;
+  var now = Date.now();
+  if (now - this._lastScrollEvt < 220) return;
+  this._lastScrollEvt = now;
+  var heavy = this._scrollEnergy > 350;
+  for (var i = 0; i < this._rigs.length; i++) {
+    var rig = this._rigs[i];
+    if (rig._state === 'run') continue;
+    var P0 = rig._P[0];
+    var jitter = { x: P0.x + rnd(-0.4, 0.4), z: P0.z + rnd(-0.4, 0.4) };
+    var after = (heavy && !this._reduced && Math.random() < 0.5) ? 'run' : 'auto';
+    rig.alertFrom(jitter, rnd(0.7, 1.4), after);
+  }
+};
+
+AnacondaWalk.prototype._onScroll = function () {
+  var y = window.scrollY || window.pageYOffset || 0;
+  this._scrollPulse(y - this._lastScrollY);
+  this._lastScrollY = y;
+};
+
+/* ---------------- DOM / renderer ---------------- */
+AnacondaWalk.prototype._initDom = function () {
+  var T = this._T, self = this, renderer;
+  if (typeof document === 'undefined' || !document.body) {
+    throw new Error('AnacondaWalk: document.body is not available yet.');
+  }
+  try {
+    renderer = new T.WebGLRenderer({ alpha: true, antialias: true });
+  } catch (e) {
+    /* rethrow: boot() resets its guard flag so a later retry can succeed */
+    if (window.console) console.warn('[AnacondaWalk] WebGL not available:', e && e.message);
+    throw e;
+  }
+  this._renderer = renderer;
+  renderer.setClearColor(0x000000, 0);
+  if (T.sRGBEncoding) renderer.outputEncoding = T.sRGBEncoding;
+  if (T.ACESFilmicToneMapping) {
+    renderer.toneMapping = T.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
+  }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this._q.cap));
+
+  var canvas = renderer.domElement;
+  canvas.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;margin:0;padding:0;border:0;outline:none;pointer-events:none;z-index:' + this.opts.zIndex + ';';
+  document.body.appendChild(canvas);
+  this._canvas = canvas;
+
+  /* context loss: pause instead of burning CPU on a dead canvas; resume
+   * automatically when the driver restores the context */
+  canvas.addEventListener('webglcontextlost', function (ev) {
+    ev.preventDefault();
+    self._setHidden(true);
+  }, false);
+  canvas.addEventListener('webglcontextrestored', function () {
+    self._setHidden(false);
+  }, false);
+
+  this._onResize = function () { self._resize(); };
+  this._onMoveBound = function (ev) { self._onPointerMove(ev); };
+  this._onDownBound = function (ev) { self._onPointerDown(ev); };
+  this._onScrollBound = function () { self._onScroll(); };
+  this._onVisBound = function () {
+    self._setHidden(!!(document.visibilityState === 'hidden' || document.hidden));
+  };
+  window.addEventListener('resize', this._onResize);
+  window.addEventListener('pointermove', this._onMoveBound, { passive: true });
+  window.addEventListener('pointerdown', this._onDownBound, { passive: true });
+  window.addEventListener('scroll', this._onScrollBound, { passive: true });
+  document.addEventListener('visibilitychange', this._onVisBound);
+  this._lastScrollY = window.scrollY || 0;
+
+  this._resize();
+
+  /* render loop: frame-rate independent dt, adaptive quality measurement,
+   * full pause when the tab is hidden */
+  var clock = new T.Clock();
+  this._clock = clock;
+  function nowMs() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
+  this._loop = function () {
+    self._rafId = requestAnimationFrame(self._loop);
+    var dt = clock.getDelta();
+    if (dt <= 0) return;
+    dt = Math.min(dt, 0.05);
+    var t0 = nowMs();
+    self.step(dt);
+    renderer.render(self._scene, self._camera);
+    self._adaptQuality(nowMs() - t0);
+  };
+  this._rafId = requestAnimationFrame(this._loop);
+};
+
+AnacondaWalk.prototype._resize = function () {
+  var w = window.innerWidth, h = window.innerHeight;
+  this._renderer.setSize(w, h, false);
+  this._camera.aspect = w / h;
+  this._camera.updateProjectionMatrix();
+  this._camera.updateMatrixWorld();
+  this._camera.matrixWorldInverse.copy(this._camera.matrixWorld).invert();
+  this._root.scale.setScalar(this._computeScale(w / h));
+  this._root.updateMatrix();
+  this._root.updateMatrixWorld(true);
+};
+
+/* ---------------- pause / resume ---------------- */
+AnacondaWalk.prototype._setHidden = function (hidden) {
+  if (this._destroyed || hidden === this._hidden) return;
+  this._hidden = hidden;
+  if (hidden) {
+    if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = 0; }
+  } else if (this._loop) {
+    if (this._clock) this._clock.getDelta();   /* flush the paused time */
+    this._rafId = requestAnimationFrame(this._loop);
+  }
+};
+
+/* ---------------- adaptive rendering quality ----------------
+ * Watches the real frame cost: if the average climbs above ~27 ms the pixel
+ * ratio steps down (never below 0.75); if there is comfortable headroom it
+ * steps back up to the device cap. */
+AnacondaWalk.prototype._adaptQuality = function (ms) {
+  var q = this._q;
+  if (!q || this._hidden) return;
+  if (q.cool > 0) { q.cool--; return; }
+  q.acc += ms; q.n++;
+  if (q.n < 45) return;
+  var avg = q.acc / q.n;
+  q.acc = 0; q.n = 0;
+  if (avg > 27 && q.dpr > 0.75) {
+    q.dpr = Math.max(0.75, q.dpr * 0.8);
+    q.cool = 150;
+    this._applyDpr();
+  } else if (avg < 13.5 && q.dpr < q.cap) {
+    q.dpr = Math.min(q.cap, q.dpr * 1.12);
+    q.cool = 300;
+    this._applyDpr();
+  }
+};
+
+AnacondaWalk.prototype._applyDpr = function () {
+  if (!this._renderer) return;
+  this._renderer.setPixelRatio(this._q.dpr);
+  this._renderer.setSize(window.innerWidth, window.innerHeight, false);
+};
+
+/* ---------------- full teardown ----------------
+ * Frees every tracked geometry, material and texture, disposes the GL
+ * context, removes all listeners and the canvas, and re-enables a later
+ * initialization. Safe to call twice. */
+AnacondaWalk.prototype.destroy = function () {
+  if (this._destroyed) return;
+  this._destroyed = true;
+  if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = 0; }
+
+  if (typeof window !== 'undefined') {
+    if (this._onResize) window.removeEventListener('resize', this._onResize);
+    if (this._onMoveBound) window.removeEventListener('pointermove', this._onMoveBound);
+    if (this._onDownBound) window.removeEventListener('pointerdown', this._onPointerDown);
+    if (this._onScrollBound) window.removeEventListener('scroll', this._onScrollBound);
+  }
+  if (typeof document !== 'undefined' && this._onVisBound) {
+    document.removeEventListener('visibilitychange', this._onVisBound);
+  }
+  if (this._mqUnbind) { try { this._mqUnbind(); } catch (e) {} }
+  this._mqUnbind = null;
+
+  if (this._canvas && this._canvas.parentNode) this._canvas.parentNode.removeChild(this._canvas);
+  this._canvas = null;
+
+  if (this._renderer) {
+    try { this._renderer.dispose(); } catch (e) {}
+    try { this._renderer.forceContextLoss(); } catch (e) {}
+  }
+  this._renderer = null;
+
+  var i;
+  for (i = 0; i < this._geos.length; i++) { try { this._geos[i].dispose(); } catch (e) {} }
+  for (i = 0; i < this._mats.length; i++) { try { this._mats[i].dispose(); } catch (e) {} }
+  for (i = 0; i < this._texs.length; i++) { try { this._texs[i].dispose(); } catch (e) {} }
+  this._geos.length = 0; this._mats.length = 0; this._texs.length = 0;
+
+  if (this._rigs) this._rigs.length = 0;
+  this._pointer = null; this._pointerLocal = null; this._ptrPrev = null;
+  this._loop = null; this._clock = null;
+
+  /* only the auto-booted instance unlocks auto-boot again */
+  if (ROOT.anacondaWalk === this) {
+    ROOT.anacondaWalk = null;
+    ROOT.__anacondaBooted = false;
+  }
+};
+
+/* ---------------- main loop ---------------- */
+AnacondaWalk.prototype.step = function (dt) {
+  dt = clamp(dt, 0.0001, 0.05);
+  this._time += dt;
+  this._scrollEnergy *= Math.exp(-2.5 * dt);
+  this._root.updateMatrixWorld(true);
+
+  if (this._pointer && this.opts.shy) {
+    var lp = this._localFromNdc(this._pointer.x, this._pointer.y, this._tmpC || (this._tmpC = new this._T.Vector3()));
+    if (lp) {
+      /* smoothed cursor speed: only a SLOW cursor reads as curiosity, a fast
+       * one stays a threat */
+      if (this._ptrPrev && dt > 0) {
+        var ddx = lp.x - this._ptrPrev.x, ddz = lp.z - this._ptrPrev.z;
+        var pv = Math.sqrt(ddx * ddx + ddz * ddz) / dt;
+        var slowTgt = pv < 1.1 ? 1 : 0;
+        this._ptrSlow = this._ptrSlow + (slowTgt - this._ptrSlow) * Math.min(1, dt * 4);
+      }
+      if (!this._ptrPrev) this._ptrPrev = { x: lp.x, z: lp.z };
+      this._ptrPrev.x = lp.x; this._ptrPrev.z = lp.z;
+      this._pointerLocal = lp;
+    } else {
+      this._pointerLocal = null;
+      this._ptrSlow = 0;
+    }
+  } else {
+    this._pointerLocal = null;
+    this._ptrSlow = 0;
+  }
+
+  for (var i = 0; i < this._rigs.length; i++) {
+    this._rigs[i].step(dt, this._time, this);
+  }
+};
+
+/* ---------------- export ---------------- */
+ROOT.AnacondaWalk = AnacondaWalk;
+ROOT.AnacondaRig = AnacondaRig;
+/* static helpers (tests / debugging) */
+AnacondaWalk.radiusAt = radiusAt;
+AnacondaWalk.GAITS = GAITS;
+
+/* ---------------- auto-boot (browsers only) ---------------- */
+if (typeof document === 'undefined') return;
+
+function whenReady(fn) {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn);
+  else fn();
+}
+function boot() {
+  whenReady(function () {
+    if (ROOT.__anacondaBooted) return;
+    ROOT.__anacondaBooted = true;
+    try {
+      ROOT.anacondaWalk = new AnacondaWalk(ROOT.AnacondaConfig || {});
+    } catch (e) {
+      /* failed init (e.g. no WebGL) must not permanently block a retry */
+      ROOT.__anacondaBooted = false;
+      ROOT.anacondaWalk = null;
+      if (window.console) console.warn('[AnacondaWalk] init failed:', e);
+    }
+  });
+}
+function loadThree(src, ok, fail) {
+  var s = document.createElement('script');
+  s.src = src; s.onload = ok; s.onerror = fail;
+  (document.head || document.body).appendChild(s);
+}
+if (ROOT.THREE) {
+  boot();
+} else {
+  loadThree('https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js', boot, function () {
+    loadThree('https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js', boot, function () {
+      loadThree('https://unpkg.com/three@0.128.0/build/three.min.js', boot, function () {
+        if (window.console) console.warn('[AnacondaWalk] could not load three.js — check your connection.');
+      });
+    });
+  });
+}
+})();
+
+</script>
